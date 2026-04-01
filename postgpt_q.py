@@ -32,6 +32,7 @@ MAX_HEBBIAN = 131072
 N_CHAMBERS  = 6
 CHAIN_STEPS = 12
 TOP_K       = 15
+MAX_PERIODIC = 4096
 QPTQ_MAGIC  = 0x51505451
 SPA_DIM     = 32
 SPA_NH      = 4
@@ -366,12 +367,20 @@ def meta_prophecy(mw, ctx, cl, V):
     for i in range(cl - na, cl):
         if ctx[i] < 256:
             appeared[ctx[i]] = 1
-    start = max(0, cl - 4)
+    start = max(0, cl - 12)  # extended window: 12 tokens back instead of 4
     for ci in range(start, cl):
         c = ctx[ci]
+        decay = 1.0 / (1.0 + float(cl - 1 - ci))  # recent tokens contribute more
         for k in range(mw.n_bi):
             if mw.bigrams[k][0] == c and mw.bigrams[k][1] < V and not appeared[mw.bigrams[k][1] % 256]:
-                out[mw.bigrams[k][1]] += mw.bigrams[k][2]
+                out[mw.bigrams[k][1]] += mw.bigrams[k][2] * decay
+    # trigram prophecy: predict from last 2 tokens as pair context
+    if cl >= 2:
+        p0, p1 = ctx[cl - 2], ctx[cl - 1]
+        for k in range(mw.n_tri):
+            if (mw.trigrams[k][0] == p0 and mw.trigrams[k][1] == p1
+                    and mw.trigrams[k][2] < V and not appeared[mw.trigrams[k][2] % 256]):
+                out[mw.trigrams[k][2]] += mw.trigrams[k][3] * 1.5  # trigrams are more specific
     mx = 0.0
     for i in range(V):
         if out[i] > mx:
@@ -422,7 +431,7 @@ def ingest_ids(mw, ids, amount=0.02):
             if not found and mw.n_hebb < MAX_HEBBIAN:
                 mw.hebbs.append([a, b, decay * max(0.01, amount)])
                 mw.n_hebb += 1
-def load_memory(mw, path):
+def load_memory(mw, path, periodic=None):
     if not os.path.exists(path):
         return False
     try:
@@ -460,10 +469,28 @@ def load_memory(mw, path):
                 if not found and mw.n_hebb < MAX_HEBBIAN:
                     mw.hebbs.append([a, b, p])
                     mw.n_hebb += 1
+            # load periodic table elements
+            try:
+                npe_data = mf.read(4)
+                if len(npe_data) == 4 and periodic is not None:
+                    npe = struct.unpack("<I", npe_data)[0]
+                    if npe > 0 and npe <= MAX_PERIODIC:
+                        for _ in range(npe):
+                            wlen = struct.unpack("B", mf.read(1))[0]
+                            if wlen > 31:
+                                wlen = 31
+                            w = mf.read(wlen).decode("utf-8", errors="replace")
+                            chamber = struct.unpack("B", mf.read(1))[0]
+                            mass = struct.unpack("<f", mf.read(4))[0]
+                            if chamber < 6:
+                                periodic.elements[w] = {"ch": chamber, "mass": mass}
+                        print("  [periodic: %d elements loaded]" % len(periodic.elements))
+            except Exception:
+                pass  # no periodic data in older memory files
         return True
     except Exception:
         return False
-def save_memory(mw, path):
+def save_memory(mw, path, periodic=None):
     with open(path, "wb") as mf:
         mf.write(struct.pack("<I", 0x514D454D))
         mf.write(struct.pack("<3i", mw.n_bi, mw.n_tri, mw.n_hebb))
@@ -473,6 +500,18 @@ def save_memory(mw, path):
             mf.write(struct.pack("<3if", mw.trigrams[i][0], mw.trigrams[i][1], mw.trigrams[i][2], mw.trigrams[i][3]))
         for i in range(mw.n_hebb):
             mf.write(struct.pack("<2if", mw.hebbs[i][0], mw.hebbs[i][1], mw.hebbs[i][2]))
+        # save periodic table
+        if periodic is not None:
+            elements = list(periodic.elements.items())
+            mf.write(struct.pack("<I", len(elements)))
+            for word, elem in elements:
+                wbytes = word.encode("utf-8")[:31]
+                mf.write(struct.pack("B", len(wbytes)))
+                mf.write(wbytes)
+                mf.write(struct.pack("B", elem["ch"]))
+                mf.write(struct.pack("<f", elem["mass"]))
+        else:
+            mf.write(struct.pack("<I", 0))
 # ── Chambers ──
 class Chambers:
     def __init__(self):
@@ -970,6 +1009,14 @@ def coherence_score(mw, ids, n, V):
             if mw.bigrams[j][0] == ids[i] and mw.bigrams[j][1] == ids[i + 1]:
                 bi_sum += mw.bigrams[j][2]
                 break
+    # trigram continuity: stronger signal than bigrams for coherence
+    tri_sum = 0.0
+    for i in range(n - 2):
+        for j in range(mw.n_tri):
+            if (mw.trigrams[j][0] == ids[i] and mw.trigrams[j][1] == ids[i + 1]
+                    and mw.trigrams[j][2] == ids[i + 2]):
+                tri_sum += mw.trigrams[j][3]
+                break
     hb_sum = 0.0
     for i in range(min(n - 1, 20)):
         a = min(ids[i], ids[i + 1])
@@ -986,7 +1033,8 @@ def coherence_score(mw, ids, n, V):
         len_bonus = 0.2
     else:
         len_bonus = -0.5
-    return bi_sum / (n - 1) + 0.3 * hb_sum / (n - 1) + len_bonus
+    tri_norm = tri_sum / (n - 2) if n > 2 else 0
+    return bi_sum / (n - 1) + 0.5 * hb_sum / (n - 1) + 0.8 * tri_norm + len_bonus
 # ── boundary check ──
 def is_boundary(bpe, tid):
     if tid < 0 or tid >= bpe.vocab_size:
@@ -1070,9 +1118,12 @@ def gen_sent(t, bpe, mw, prompt, plen, temp, maxo, parl, global_destiny, ch_ptr)
 
         prev_logits = list(raw)
         last = ctx[cl - 1]
+        # adaptive destiny momentum: faster update early, stable later
+        d_mom = 0.85 if step < 20 else 0.92
+        d_lr = 1.0 - d_mom
         if last < V:
             for d in range(D):
-                destiny[d] = 0.9 * destiny[d] + 0.1 * t.tok[last * D + d]
+                destiny[d] = d_mom * destiny[d] + d_lr * t.tok[last * D + d]
         dn = math.sqrt(sum(destiny[d] * destiny[d] for d in range(D)) + 1e-10)
 
         hs = max(0, cl - 8)
@@ -1088,10 +1139,10 @@ def gen_sent(t, bpe, mw, prompt, plen, temp, maxo, parl, global_destiny, ch_ptr)
         tmag = sum(abs(raw[v]) for v in range(V)) / (V if V > 0 else 1)
         has_tf = tmag > 0.1
 
-        # Dario field coefficients
-        c_heb = (0.4 if has_tf else 0.8) * am
-        c_pro = (0.2 if has_tf else 0.5) * bm
-        c_ds  = (0.3 if has_tf else 0.1) * gm
+        # Dario field coefficients — boosted for better coherence
+        c_heb = (0.6 if has_tf else 1.0) * am
+        c_pro = (0.4 if has_tf else 0.7) * bm
+        c_ds  = (0.3 if has_tf else 0.15) * gm
         c_bg  = 5.0 if has_tf else 15.0
         c_tg  = 3.0 if has_tf else 10.0
 
@@ -1410,36 +1461,56 @@ def gen_chain(t, bpe, mw, ch, cids, clen, has_weights, parl, periodic=None, inte
         ch_xfire(ch, 3)
         ch.debt = 0.9 * ch.debt + 0.05
 
-    # SPA cross-attend
-    spa_embs = []
-    for i in range(CHAIN_STEPS):
-        spa_embs.append(spa_embed_sentence(spa, chain_ids[i], chain_lens[i]))
-    spa_scores = spa_cross_attend(spa, spa_embs, CHAIN_STEPS)
+    # SPA: iterative cross-attention — reseed weak sentences, verify improvement
+    spa_embs = [None] * CHAIN_STEPS
+    spa_scores = [0.0] * CHAIN_STEPS
+    for spa_pass in range(2):
+        for i in range(CHAIN_STEPS):
+            spa_embs[i] = spa_embed_sentence(spa, chain_ids[i], chain_lens[i])
+        spa_scores = spa_cross_attend(spa, spa_embs, CHAIN_STEPS)
 
-    min_sc = spa_scores[0]
-    weak_idx = 0
-    for i in range(1, CHAIN_STEPS):
-        if spa_scores[i] < min_sc:
-            min_sc = spa_scores[i]
-            weak_idx = i
-    avg_sc = sum(spa_scores) / CHAIN_STEPS
+        min_sc = spa_scores[0]
+        weak_idx = 0
+        for i in range(1, CHAIN_STEPS):
+            if spa_scores[i] < min_sc:
+                min_sc = spa_scores[i]
+                weak_idx = i
+        avg_sc = sum(spa_scores) / CHAIN_STEPS
 
-    if min_sc < avg_sc * 0.5:
-        print("  [SPA] reseeding step %d (score=%.2f, avg=%.2f)" % (weak_idx + 1, min_sc, avg_sc))
-        r = random.randint(0, max(0, clen - 6))
-        prompt = [cids[r], cids[r + 1], cids[r + 2], cids[r + 3], cids[r + 4]]
-        reseed_temp = 0.55 if has_weights else 0.7
-        result = gen_sent(t, bpe, mw, prompt, 5, reseed_temp, 256, parl, gdest, ch)
-        sys.stdout.write("  [%2d] + " % (weak_idx + 1))
-        printed = 0
-        for i in range(len(result)):
-            if printed >= 200:
-                break
-            s = bpe_decode_token(bpe, result[i])
-            if s:
-                sys.stdout.write(s)
-                printed += len(s)
-        print()
+        if min_sc < avg_sc * 0.6:  # slightly more aggressive threshold
+            print("  [SPA-%d] reseeding step %d (score=%.2f, avg=%.2f)" % (spa_pass + 1, weak_idx + 1, min_sc, avg_sc))
+            # use neighbor sentences as context for better continuity
+            seed_src = weak_idx - 1 if weak_idx > 0 else (weak_idx + 1 if weak_idx < CHAIN_STEPS - 1 else 0)
+            nprom = min(3, chain_lens[seed_src])
+            prompt = chain_ids[seed_src][chain_lens[seed_src] - nprom:chain_lens[seed_src]]
+            reseed_temp = 0.55 if has_weights else 0.7
+            result = gen_sent(t, bpe, mw, prompt, nprom, reseed_temp, 256, parl, gdest, ch)
+            new_sc = coherence_score(mw, result, len(result), t.V)
+            old_sc = coherence_score(mw, chain_ids[weak_idx], chain_lens[weak_idx], t.V)
+            if new_sc > old_sc * 0.7 or len(result) > chain_lens[weak_idx]:  # accept if reasonable
+                chain_ids[weak_idx] = list(result)
+                chain_lens[weak_idx] = len(result)
+                sys.stdout.write("  [%2d] + " % (weak_idx + 1))
+                printed = 0
+                for i in range(len(result)):
+                    if printed >= 200:
+                        break
+                    s = bpe_decode_token(bpe, result[i])
+                    if s:
+                        sys.stdout.write(s)
+                        printed += len(s)
+                print("  {reseeded}")
+                # feed reseeded text back into metaweights
+                text_parts = []
+                for i in range(len(result)):
+                    s = bpe_decode_token(bpe, result[i])
+                    if s:
+                        text_parts.append(s)
+                out_text = "".join(text_parts)
+                ch.feel(out_text, periodic)
+                ingest_ids(mw, result, 0.003)
+        else:
+            break  # no weak sentences, stop iterating
 
     # Hebbian decay
     for i in range(mw.n_hebb):
@@ -1519,7 +1590,7 @@ def main():
         t.clen = 0
         t.logits = [0.0] * t.V
 
-    if load_memory(mw, "q.memory"):
+    if load_memory(mw, "q.memory", periodic):
         print("  [memory loaded: %d bi, %d tri, %d hebb from q.memory]" % (mw.n_bi, mw.n_tri, mw.n_hebb))
 
     interference = Interference()
@@ -1563,8 +1634,8 @@ def main():
 
     # save memory
     try:
-        save_memory(mw, "q.memory")
-        print("  [memory saved: %d bi, %d tri, %d hebb \u2192 q.memory]" % (mw.n_bi, mw.n_tri, mw.n_hebb))
+        save_memory(mw, "q.memory", periodic)
+        print("  [memory saved: %d bi, %d tri, %d hebb, %d periodic \u2192 q.memory]" % (mw.n_bi, mw.n_tri, mw.n_hebb, len(periodic.elements)))
     except Exception:
         pass
 
