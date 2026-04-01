@@ -1,5 +1,5 @@
 """
-postgpt_q.py — PostGPT-Q: Resonant Reasoning Engine
+qresearch.py — PostGPT-Q: Resonant Reasoning Engine (Research/Training)
 
 Built on PostGPT. Val autograd, dual attention (Content + RRPRAM),
 metaweight seeding, Dario equation.
