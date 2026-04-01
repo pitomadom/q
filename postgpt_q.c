@@ -344,7 +344,7 @@ static void ch_modulate(const Chambers *c, float *a, float *b, float *g, float *
 }
 static void ch_summary(const Chambers *c, char *buf, int sz){
     int pos=0; buf[0]=0;
-    for(int i=0;i<6;i++) if(c->act[i]>0.05f) pos+=snprintf(buf+pos,sz-pos,"%s%s:%.0f%%",pos?" ":"",CH_N[i],c->act[i]*100.0f);
+    for(int i=0;i<6;i++) if(c->act[i]>0.05f&&pos<sz-1){int w=snprintf(buf+pos,sz-pos,"%s%s:%.0f%%",pos?" ":"",CH_N[i],c->act[i]*100.0f);if(w>0&&pos+w<sz)pos+=w;else break;}
     if(pos==0) snprintf(buf,sz,"quiet");
 }
 
