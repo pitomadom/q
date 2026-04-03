@@ -419,6 +419,52 @@ static void qexp_add_chunk(int step, const char *doc_name, int chunk_start, floa
     memset(e,0,sizeof(*e)); e->step=step; e->chunk_start=chunk_start; e->resonance=resonance;
     if(doc_name) snprintf(e->doc_name,sizeof(e->doc_name),"%s",doc_name);
 }
+static void consolidate_experience(MetaW *mw, PeriodicTable *pt, Chambers *ch){
+    float scar_avg=0, worm_success=0, worm_coh=0, prop_avg=0, chunk_avg=0;
+    if(QEXP.n_scars>0){ for(int i=0;i<QEXP.n_scars;i++) scar_avg+=QEXP.scars[i].scar; scar_avg/=QEXP.n_scars; }
+    if(QEXP.n_wormholes>0){
+        for(int i=0;i<QEXP.n_wormholes;i++){ worm_success += QEXP.wormholes[i].success?1.0f:0.0f; worm_coh += QEXP.wormholes[i].coherence; }
+        worm_success/=QEXP.n_wormholes; worm_coh/=QEXP.n_wormholes;
+    }
+    if(QEXP.n_prophecies>0){ for(int i=0;i<QEXP.n_prophecies;i++) prop_avg+=QEXP.prophecies[i].pressure; prop_avg/=QEXP.n_prophecies; }
+    if(QEXP.n_chunks>0){ for(int i=0;i<QEXP.n_chunks;i++) chunk_avg+=QEXP.chunks[i].resonance; chunk_avg/=QEXP.n_chunks; }
+    if(QEXP.n_phases>0){
+        float inv=1.0f/QEXP.n_phases, flow=0,fear=0,voidv=0,cmplx=0;
+        for(int i=0;i<QEXP.n_phases;i++){ flow+=QEXP.phases[i].flow; fear+=QEXP.phases[i].fear; voidv+=QEXP.phases[i].voidv; cmplx+=QEXP.phases[i].complexity; }
+        ch->act[CH_FLOW]=clampf(ch->act[CH_FLOW]>(flow*inv)?ch->act[CH_FLOW]:(flow*inv),0,1);
+        ch->act[CH_FEAR]=clampf(ch->act[CH_FEAR]>(fear*inv)?ch->act[CH_FEAR]:(fear*inv),0,1);
+        ch->act[CH_VOID]=clampf(ch->act[CH_VOID]>(voidv*inv)?ch->act[CH_VOID]:(voidv*inv),0,1);
+        ch->act[CH_CMPLX]=clampf(ch->act[CH_CMPLX]>(cmplx*inv)?ch->act[CH_CMPLX]:(cmplx*inv),0,1);
+    }
+    if(QEXP.n_wormholes>0) ch->presence=clampf(ch->presence>(0.18f*worm_success+0.12f*worm_coh)?ch->presence:(0.18f*worm_success+0.12f*worm_coh),0,1);
+    if(QEXP.n_prophecies>0) ch->debt=clampf(ch->debt>(0.25f*prop_avg)?ch->debt:(0.25f*prop_avg),0,1);
+    if(QEXP.n_scars>0) ch->scar=clampf(ch->scar>(0.40f*scar_avg)?ch->scar:(0.40f*scar_avg),0,1);
+    {float prop_boost=clampf(0.05f+0.18f*prop_avg+0.02f*chunk_avg+0.08f*worm_success-0.04f*scar_avg,0,0.28f);
+    for(int i=0;i<mw->n_prophecy&&i<8;i++){ mw->prophecies[i].strength=clampf(mw->prophecies[i].strength+prop_boost,0,1); if(mw->prophecies[i].age<1) mw->prophecies[i].age=1; }}
+    if(mw->n_prophecy>=2){
+        float pair_strength=clampf(0.02f+0.06f*prop_avg+0.01f*chunk_avg+0.05f*worm_success,0,0.18f);
+        int top[4], topn=mw->n_prophecy<4?mw->n_prophecy:4;
+        for(int i=0;i<topn;i++) top[i]=mw->prophecies[i].target;
+        for(int i=0;i<topn;i++) for(int j=i+1;j<topn;j++){
+            int a=top[i]<top[j]?top[i]:top[j], b=top[i]<top[j]?top[j]:top[i], found=0;
+            for(int k=0;k<mw->n_hebb;k++) if(mw->hebbs[k].a==a&&mw->hebbs[k].b==b){ mw->hebbs[k].str+=pair_strength; found=1; break; }
+            if(!found&&mw->n_hebb<MAX_HEBBIAN){ mw->hebbs[mw->n_hebb].a=a; mw->hebbs[mw->n_hebb].b=b; mw->hebbs[mw->n_hebb].str=pair_strength; mw->n_hebb++; }
+        }
+    }
+    if(pt->n>0){
+        float reinforce=clampf(0.02f+0.012f*chunk_avg+0.05f*worm_success+0.04f*prop_avg-0.02f*scar_avg,0,0.18f);
+        int dom=0; for(int i=1;i<6;i++) if(ch->act[i]>ch->act[dom]) dom=i;
+        for(int pass=0;pass<2;pass++){
+            int touched=0;
+            for(int i=0;i<pt->n&&touched<8;i++){
+                int match = (pt->elements[i].chamber==dom);
+                if((pass==0 && match) || (pass==1 && !match)) continue;
+                pt->elements[i].mass=clampf(pt->elements[i].mass+reinforce*(match?1.0f:0.65f),0,1);
+                touched++;
+            }
+        }
+    }
+}
 static int periodic_find(const PeriodicTable *pt, const char *word){
     for(int i=0;i<pt->n;i++) if(strcmp(pt->elements[i].word,word)==0) return i;
     return -1;
@@ -1753,6 +1799,7 @@ int main(int argc, char **argv){
         gen_chain(&t,&bpe,mw,&ch,cids,clen,has_weights,&parl,&pt,&itf,input);
     }
     /* save evolved MetaWeights — Q remembers between sessions */
+    consolidate_experience(mw,&pt,&ch);
     qsqlite_save(mw,"q.sqlite",&pt,&ch);
     {FILE *mf=fopen("q.memory","wb");
     if(mf){

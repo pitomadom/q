@@ -294,6 +294,27 @@ class UnifiedContractTests(unittest.TestCase):
             self.assertGreaterEqual(len(loaded_mw.prophecies), 1)
             self.assertIn("resonance", loaded_pt.elements)
 
+    def test_experience_consolidation_reinforces_long_horizon_residue(self):
+        mw = q.MetaW()
+        q.prophecy_add(mw, 17, 0.2)
+        q.prophecy_add(mw, 23, 0.25)
+        pt = q.PeriodicTable()
+        pt.elements["resonance"] = {"ch": q.CH_FLOW, "mass": 0.2}
+        pt.elements["paradox"] = {"ch": q.CH_CMPLX, "mass": 0.15}
+        ch = q.Chambers()
+        ch.act[q.CH_FLOW] = 0.6
+        events = q.new_experience_log()
+        events["wormholes"].append({"step": 2, "success": True, "coherence": 0.5, "debt": 0.12})
+        events["prophecies"].append({"step": 4, "pressure": 0.6, "debt": 0.2})
+        events["phases"].append({"step": 1, "phase": "flow", "flow": 0.7, "fear": 0.1, "void": 0.05, "complexity": 0.4})
+        events["chunks"].append({"step": 3, "doc_name": "essay.txt", "chunk_start": 16, "resonance": 5.0})
+        q.consolidate_experience(mw, pt, ch, events)
+        self.assertGreaterEqual(mw.prophecies[0][1], 0.2)
+        self.assertGreaterEqual(mw.prophecies[1][1], 0.25)
+        self.assertGreater(mw.n_hebb, 0)
+        self.assertGreater(pt.elements["flow"]["mass"], 0.6)
+        self.assertGreater(ch.presence, 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

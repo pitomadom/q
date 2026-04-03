@@ -697,6 +697,59 @@ def save_memory_sqlite(mw, path, periodic=None, chambers=None, events=None):
         )
     conn.commit()
     conn.close()
+def consolidate_experience(mw, periodic=None, chambers=None, events=None):
+    if events is None:
+        return
+    periodic = periodic or PeriodicTable()
+    chambers = chambers or Chambers()
+    scars = events.get("scars", [])
+    worms = events.get("wormholes", [])
+    props = events.get("prophecies", [])
+    phases = events.get("phases", [])
+    chunks = events.get("chunks", [])
+    scar_avg = sum(ev["scar"] for ev in scars) / len(scars) if scars else 0.0
+    worm_success = sum(1.0 if ev.get("success") else 0.0 for ev in worms) / len(worms) if worms else 0.0
+    worm_coh = sum(ev.get("coherence", 0.0) for ev in worms) / len(worms) if worms else 0.0
+    prop_avg = sum(ev.get("pressure", 0.0) for ev in props) / len(props) if props else 0.0
+    chunk_avg = sum(ev.get("resonance", 0.0) for ev in chunks) / len(chunks) if chunks else 0.0
+    if phases:
+        inv = 1.0 / len(phases)
+        chambers.act[CH_FLOW] = clampf(max(chambers.act[CH_FLOW], inv * sum(ev["flow"] for ev in phases)), 0.0, 1.0)
+        chambers.act[CH_FEAR] = clampf(max(chambers.act[CH_FEAR], inv * sum(ev["fear"] for ev in phases)), 0.0, 1.0)
+        chambers.act[CH_VOID] = clampf(max(chambers.act[CH_VOID], inv * sum(ev["void"] for ev in phases)), 0.0, 1.0)
+        chambers.act[CH_CMPLX] = clampf(max(chambers.act[CH_CMPLX], inv * sum(ev["complexity"] for ev in phases)), 0.0, 1.0)
+    if worms:
+        chambers.presence = clampf(max(chambers.presence, 0.18 * worm_success + 0.12 * worm_coh), 0.0, 1.0)
+    if props:
+        chambers.debt = clampf(max(chambers.debt, 0.25 * prop_avg), 0.0, 1.0)
+    if scars:
+        chambers.scar = clampf(max(chambers.scar, 0.40 * scar_avg), 0.0, 1.0)
+    prop_boost = clampf(0.05 + 0.18 * prop_avg + 0.02 * chunk_avg + 0.08 * worm_success - 0.04 * scar_avg, 0.0, 0.28)
+    for item in mw.prophecies[: min(8, len(mw.prophecies))]:
+        item[1] = clampf(item[1] + prop_boost, 0.0, 1.0)
+        item[2] = max(item[2], 1)
+    if len(mw.prophecies) >= 2:
+        pair_strength = clampf(0.02 + 0.06 * prop_avg + 0.01 * chunk_avg + 0.05 * worm_success, 0.0, 0.18)
+        top_targets = [item[0] for item in mw.prophecies[:4]]
+        for i in range(len(top_targets)):
+            for j in range(i + 1, len(top_targets)):
+                a, b = sorted((top_targets[i], top_targets[j]))
+                found = False
+                for hb in mw.hebbs:
+                    if hb[0] == a and hb[1] == b:
+                        hb[2] += pair_strength
+                        found = True
+                        break
+                if not found and mw.n_hebb < MAX_HEBBIAN:
+                    mw.hebbs.append([a, b, pair_strength])
+                    mw.n_hebb += 1
+    if periodic.elements:
+        reinforce = clampf(0.02 + 0.012 * chunk_avg + 0.05 * worm_success + 0.04 * prop_avg - 0.02 * scar_avg, 0.0, 0.18)
+        dom = max(range(N_CHAMBERS), key=lambda i: chambers.act[i])
+        ranked = sorted(periodic.elements.items(), key=lambda item: (item[1]["ch"] != dom, -item[1]["mass"], item[0]))
+        for word, elem in ranked[: min(8, len(ranked))]:
+            bias = 1.0 if elem["ch"] == dom else 0.65
+            elem["mass"] = clampf(elem["mass"] + reinforce * bias, 0.0, 1.0)
 def ingest_ids(mw, ids, amount=0.02):
     ulen = len(ids)
     if ulen <= 1:
@@ -2352,6 +2405,7 @@ def main():
 
     # save memory
     try:
+        consolidate_experience(mw, periodic, ch, run_events)
         save_memory_sqlite(mw, "q.sqlite", periodic, ch, run_events)
         save_memory(mw, "q.memory", periodic, ch)
         save_spore(mw, spore_path, periodic, ch)
