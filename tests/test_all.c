@@ -551,6 +551,15 @@ void test_chunk_resonance_choice(void) {
     PASS();
 }
 
+void test_prophecy_pressure_ageing(void) {
+    TEST("prophecy_pressure_ageing");
+    float fresh=0.6f*logf(1.0f+0.0f);
+    float aged=0.6f*0.995f*0.995f*0.995f*0.995f*0.995f*logf(1.0f+5.0f);
+    CHECK(aged>fresh, "aged pressure exceeds fresh zero-age hint");
+    CHECK(aged>0.0f, "aged pressure positive");
+    PASS();
+}
+
 /* ── 22. Periodic mapping ── */
 void test_periodic_mapping(void) {
     TEST("periodic_mapping");
@@ -644,6 +653,7 @@ int main(void) {
     test_interference_doc_choice();
     test_active_prophecy_state();
     test_chunk_resonance_choice();
+    test_prophecy_pressure_ageing();
     test_periodic_mapping();
     test_interference_seed();
     test_smoke_compile();

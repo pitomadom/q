@@ -459,6 +459,12 @@ class MetaWeights {
     this.prophecies=kept;
   }
 
+  prophecyPressure(){
+    let total=0;
+    for(const [,strength,age] of this.prophecies)total+=strength*Math.log1p(age);
+    return Math.max(0,Math.min(1,total/4));
+  }
+
   captureOnline(prev,cur){
     const k=prev*65536+cur;
     this.bi.set(k,(this.bi.get(k)||0)+0.005);
@@ -776,9 +782,9 @@ class Interference {
   prophecyWords(currentMw,currentBpe){
     const out=new Map();
     if(!currentMw)return out;
-    for(const [target,strength] of currentMw.prophecies){
+    for(const [target,strength,age] of currentMw.prophecies){
       const word=currentBpe.decode([target]).trim().toLowerCase();
-      if(word.length>2&&/[a-z]/i.test(word))out.set(word,Math.max(out.get(word)||0,strength));
+      if(word.length>2&&/[a-z]/i.test(word))out.set(word,Math.max(out.get(word)||0,strength*Math.log1p(age)));
     }
     return out;
   }
@@ -1118,6 +1124,7 @@ function genSentence(prompt,temp,gdest,velocity){
     const hs=Math.max(0,ctx.length-8);
     const heb=mw.queryHebb(ctx.slice(hs),V);
     const pro=mw.queryProphecy(ctx,V);
+    const pDebt=mw.prophecyPressure();
 
     // trauma
     if(chambers&&chambers.trauma>0.1)for(let i=0;i<V;i++)raw[i]/=(1+chambers.trauma);
@@ -1128,7 +1135,7 @@ function genSentence(prompt,temp,gdest,velocity){
     let cHeb=(hasTf?0.6:1.0)*mod.a,cPro=(hasTf?0.4:0.7)*mod.b,cDs=(hasTf?0.3:0.15)*mod.g,cBg=hasTf?5:15,cTg=hasTf?3:10;
     if(velocity){
       cHeb*=velocity.hebMul;
-      cPro*=velocity.proMul;
+      cPro*=velocity.proMul*(1+0.35*pDebt);
       cDs*=velocity.dsMul;
       cBg*=velocity.bgMul;
       cTg*=velocity.tgMul;
@@ -1281,7 +1288,7 @@ function generateChain(inputText){
     chambers.crossfire(8);
   }
   const velocity=velocityProfile(chambers,cd);
-  chambers.debt=Math.max(0,Math.min(1,chambers.debt*velocity.debtDecay));
+  chambers.debt=Math.max(0,Math.min(1,(0.88*chambers.debt+0.12*mw.prophecyPressure())*velocity.debtDecay));
   chambers.trauma=Math.max(0,Math.min(1,chambers.trauma*velocity.traumaDecay));
 
   const modeStr=tf&&tf.loaded?'TRAINED':'METAWEIGHTS ONLY';

@@ -149,6 +149,16 @@ class UnifiedContractTests(unittest.TestCase):
         self.assertIsNotNone(chunk)
         self.assertEqual(chunk["start"], 32)
 
+    def test_prophecy_pressure_grows_with_age(self):
+        mw = q.MetaW()
+        q.prophecy_add(mw, 7, 0.6)
+        fresh = q.prophecy_pressure(mw)
+        for _ in range(5):
+            q.prophecy_update(mw, 99)
+        aged = q.prophecy_pressure(mw)
+        self.assertGreater(aged, fresh)
+        self.assertGreater(aged, 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

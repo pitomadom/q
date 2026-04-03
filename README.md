@@ -48,6 +48,15 @@ Coefficients are adaptive — with trained weights: `c_heb=0.6, c_pro=0.4, c_ds=
 
 Extended prophecy window: looks back **12 tokens** (not just the last few) with **recency decay** weighting — recent tokens contribute more to prediction. Additionally, **trigram prophecy** searches for matching 2-token context pairs and boosts predictions with 1.5× specificity multiplier. This creates mid-range pattern awareness that dramatically improves sentence coherence.
 
+Prophecy is also persistent during inference. Q keeps a small active field of expected next concepts. These expectations:
+
+- **age** when unfulfilled
+- **decay** slowly rather than vanishing immediately
+- **collapse** when the expected token actually arrives
+- feed a numeric **prophecy debt pressure** back into coefficient modulation and chain debt
+
+This means unresolved expectations continue to bend continuation until they are either fulfilled or dissipate.
+
 ### DOE Parliament (δ — the physics)
 
 Democracy of Experts. 4 LoRA experts (rank=4) that vote, learn, split, and die during inference:
@@ -93,6 +102,19 @@ Temperature oscillates at 7.83Hz (Earth's electromagnetic fundamental) + 3 harmo
 
 Loads documents from `docs/` folder. Extracts "heavy" tokens (high bigram participation) from each document. During generation, 30% chance per step to inject an interference seed — a token from the document corpus selected by **chamber alignment** (dominant chamber matches element's periodic classification). Creates cross-topic associations.
 
+Q now uses a **KK-lite chunk resonance** layer rather than blunt whole-document pressure. Each document is split into short BPE-derived chunks, and the engine chooses:
+
+1. a resonant document
+2. then a resonant chunk inside it
+
+Chunk scoring combines:
+
+- lexical overlap with the current prompt
+- chamber / periodic alignment
+- active prophecy field pressure
+
+The selected chunk then nudges destiny and logits. This is not RAG and not external retrieval. The text acts as a magnetic substrate inside the same inference loop.
+
 **Wormhole**: rare event (2-17% based on calendar dissonance) that flips generation direction and jumps to the farthest document. Marked with `{wormhole}` in output.
 
 ### Periodic Table (semantic classification)
@@ -119,6 +141,8 @@ The backward/forward split is determined by `0.3 + 0.4*debt + 0.1*calendar_disso
 5. **Frequency penalty**: ultra-common tokens (>1% corpus) dampened
 6. **Word Capture**: after each generated token, update MetaWeights online (bigram + Hebbian)
 7. **Parliament injection**: DOE experts inject δ into logits, then Hebbian update from prophecy debt
+8. **Aged prophecy pressure**: unresolved expectations boost `c_pro` and feed chain debt, making continuation more directionally persistent
+9. **KK-lite chunk pressure**: selected chunks from `docs/` act as local resonance sources for interference and continuation
 
 ### Persistent Destiny
 

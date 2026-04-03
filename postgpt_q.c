@@ -264,6 +264,11 @@ static void prophecy_update(MetaW *mw, int token){
     }
     mw->n_prophecy=w;
 }
+static float prophecy_pressure(const MetaW *mw){
+    float total=0;
+    for(int i=0;i<mw->n_prophecy;i++) total+=mw->prophecies[i].strength*logf(1.0f+(float)mw->prophecies[i].age);
+    return clampf(total/4.0f,0,1);
+}
 
 static void ingest_ids(MetaW *mw, const int *ids, int n, float amount){
     if(n<=1) return;
@@ -502,7 +507,7 @@ static void interf_summarize_ids(const int *ids, int n, const BPE *bpe,
     }
 }
 
-static float interf_item_score(const int *heavy, int n_heavy, char keywords[][32], int n_keywords,
+static float interf_item_score(const int *heavy, int n_heavy, const char keywords[][32], int n_keywords,
                                const char *text, int dom, const PeriodicTable *pt,
                                const MetaW *mw, const BPE *bpe){
     float score=0.01f*(float)n_heavy;
@@ -516,7 +521,7 @@ static float interf_item_score(const int *heavy, int n_heavy, char keywords[][32
             for(int pi=0;pi<mw->n_prophecy;pi++){
                 char pbuf[64]; bpe_decode_token(bpe,mw->prophecies[pi].target,pbuf,sizeof(pbuf));
                 for(int j=0;pbuf[j];j++) pbuf[j]=(char)tolower((unsigned char)pbuf[j]);
-                if(strcmp(word,pbuf)==0) score+=0.9f*mw->prophecies[pi].strength;
+                if(strcmp(word,pbuf)==0) score+=0.9f*mw->prophecies[pi].strength*logf(1.0f+(float)mw->prophecies[pi].age);
             }
         }
     }
@@ -1000,6 +1005,7 @@ static int gen_sent(TF *t, const BPE *bpe, MetaW *mw,
         float *pro=calloc(V,sizeof(float));
         int hs=cl>8?cl-8:0; meta_hebb(mw,ctx+hs,cl-hs,heb,V);
         meta_prophecy(mw,ctx,cl,pro,V);
+        float p_debt=prophecy_pressure(mw);
         /* trauma gravity: high trauma dampens all logits */
         if(ch_ptr&&ch_ptr->trauma>0.1f)
             for(int i=0;i<V;i++) raw[i]/=(1.0f+ch_ptr->trauma);
@@ -1009,7 +1015,7 @@ static int gen_sent(TF *t, const BPE *bpe, MetaW *mw,
         /* Dario field: B + α·H + β·P + γ·D + T — stronger without weights */
         float c_heb=(has_tf?0.6f:1.0f)*am, c_pro=(has_tf?0.4f:0.7f)*bm;
         float c_ds=(has_tf?0.3f:0.15f)*gm, c_bg=has_tf?5.0f:15.0f, c_tg=has_tf?3.0f:10.0f;
-        if(vel){c_heb*=vel->heb_mul;c_pro*=vel->pro_mul;c_ds*=vel->ds_mul;c_bg*=vel->bg_mul;c_tg*=vel->tg_mul;}
+        if(vel){c_heb*=vel->heb_mul;c_pro*=vel->pro_mul*(1.0f+0.35f*p_debt);c_ds*=vel->ds_mul;c_bg*=vel->bg_mul;c_tg*=vel->tg_mul;}
         float c_doc=has_tf?0.18f:0.32f;
         for(int i=0;i<V;i++){
             float bg=meta_bi(mw,ctx[cl-1],i);
@@ -1158,7 +1164,7 @@ static void gen_chain(TF *t, const BPE *bpe, MetaW *mw, Chambers *ch,
         ch_xfire(ch,8);
     }
     VelocityProfile vel=velocity_profile(ch,cd);
-    ch->debt=clampf(ch->debt*vel.debt_decay,0,1);
+    ch->debt=clampf((0.88f*ch->debt+0.12f*prophecy_pressure(mw))*vel.debt_decay,0,1);
     ch->trauma=clampf(ch->trauma*vel.trauma_decay,0,1);
 
     char chbuf[256];

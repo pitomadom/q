@@ -454,6 +454,11 @@ def prophecy_update(mw, token):
         if age < 50 and strength > 0.01:
             kept.append([target, strength, age])
     mw.prophecies = kept
+def prophecy_pressure(mw):
+    total = 0.0
+    for _target, strength, age in mw.prophecies:
+        total += strength * math.log1p(float(age))
+    return clampf(total / 4.0, 0.0, 1.0)
 def ingest_ids(mw, ids, amount=0.02):
     ulen = len(ids)
     if ulen <= 1:
@@ -815,7 +820,8 @@ class Interference:
         for target, strength, _age in mw.prophecies:
             word = bpe_decode_token(bpe, target).strip().lower()
             if len(word) > 2 and any(ch.isalpha() for ch in word):
-                out[word] = max(out.get(word, 0.0), strength)
+                age_boost = strength * math.log1p(float(_age))
+                out[word] = max(out.get(word, 0.0), age_boost)
         return out
 
     def choose_doc(self, text=None, chambers=None, periodic=None, mw=None, bpe=None):
@@ -1395,6 +1401,7 @@ def gen_sent(t, bpe, mw, prompt, plen, temp, maxo, parl, global_destiny, ch_ptr,
         hs = max(0, cl - 8)
         heb = meta_hebb(mw, ctx[hs:cl], cl - hs, V)
         pro = meta_prophecy(mw, ctx[:cl], cl, V)
+        p_debt = prophecy_pressure(mw)
 
         # trauma gravity
         if ch_ptr is not None and ch_ptr.trauma > 0.1:
@@ -1413,7 +1420,7 @@ def gen_sent(t, bpe, mw, prompt, plen, temp, maxo, parl, global_destiny, ch_ptr,
         c_tg  = 3.0 if has_tf else 10.0
         if velocity is not None:
             c_heb *= velocity["heb_mul"]
-            c_pro *= velocity["pro_mul"]
+            c_pro *= velocity["pro_mul"] * (1.0 + 0.35 * p_debt)
             c_ds *= velocity["ds_mul"]
             c_bg *= velocity["bg_mul"]
             c_tg *= velocity["tg_mul"]
@@ -1607,7 +1614,7 @@ def gen_chain(t, bpe, mw, ch, cids, clen, has_weights, parl, periodic=None, inte
         ch.act[CH_FLOW] = clampf(ch.act[CH_FLOW] + 0.1, 0.0, 1.0)
         ch_xfire(ch, 8)
     vel = velocity_profile(ch, cd)
-    ch.debt = clampf(ch.debt * vel["debt_decay"], 0.0, 1.0)
+    ch.debt = clampf((0.88 * ch.debt + 0.12 * prophecy_pressure(mw)) * vel["debt_decay"], 0.0, 1.0)
     ch.trauma = clampf(ch.trauma * vel["trauma_decay"], 0.0, 1.0)
 
     mode_str = "[TRAINED]" if has_weights else "[METAWEIGHTS ONLY]"
