@@ -1082,6 +1082,9 @@ function saveBrowserMemory(){
   if(chambers){
     data.chambers={soma:[...chambers.soma],presence:chambers.presence,debt:chambers.debt,trauma:chambers.trauma,scar:chambers.scar};
   }
+  if(parliament){
+    data.parliament={lastK:parliament.lastK,lastEntropy:parliament.lastEntropy,lastDiversity:parliament.lastDiversity,lastWinners:[...parliament.lastWinners],lastBirths:parliament.lastBirths||0,lastDeaths:parliament.lastDeaths||0,lastConsolidations:parliament.lastConsolidations||0};
+  }
   localStorage.setItem('q.memory',JSON.stringify(data));
 }
 
@@ -1113,6 +1116,15 @@ function loadBrowserMemory(){
       chambers.debt=Math.max(0,Math.min(1,Number(mem.chambers.debt)||0));
       chambers.trauma=Math.max(0,Math.min(1,Number(mem.chambers.trauma)||0));
       chambers.scar=Math.max(0,Math.min(1,Number(mem.chambers.scar)||0));
+    }
+    if(mem.parliament&&parliament){
+      parliament.lastK=Number(mem.parliament.lastK)||0;
+      parliament.lastEntropy=Number(mem.parliament.lastEntropy)||0;
+      parliament.lastDiversity=Number(mem.parliament.lastDiversity)||0;
+      parliament.lastWinners=Array.isArray(mem.parliament.lastWinners)?mem.parliament.lastWinners.slice(0,MAX_EXPERTS):[];
+      parliament.lastBirths=Number(mem.parliament.lastBirths)||0;
+      parliament.lastDeaths=Number(mem.parliament.lastDeaths)||0;
+      parliament.lastConsolidations=Number(mem.parliament.lastConsolidations)||0;
     }
     return true;
   }catch(_err){return false;}

@@ -41,11 +41,11 @@ QSQL_SCHEMA = 1
 QSPORE_MAGIC = 0x51535052
 QSPORE_VERSION = 1
 def new_experience_log():
-    return {"scars": [], "wormholes": [], "prophecies": [], "phases": [], "chunks": []}
+    return {"scars": [], "wormholes": [], "prophecies": [], "phases": [], "chunks": [], "parliament": []}
 def merge_experience_log(dst, src):
     if dst is None or src is None:
         return dst
-    for key in ("scars", "wormholes", "prophecies", "phases", "chunks"):
+    for key in ("scars", "wormholes", "prophecies", "phases", "chunks", "parliament"):
         dst[key].extend(src.get(key, []))
     return dst
 SPA_DIM     = 32
@@ -571,6 +571,19 @@ def sqlite_init(conn):
         resonance REAL NOT NULL,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
+    CREATE TABLE IF NOT EXISTS parliament_events(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        episode_id INTEGER NOT NULL,
+        step INTEGER NOT NULL,
+        experts INTEGER NOT NULL,
+        winners INTEGER NOT NULL,
+        diversity REAL NOT NULL,
+        avg_vitality REAL NOT NULL,
+        births INTEGER NOT NULL,
+        deaths INTEGER NOT NULL,
+        consolidations INTEGER NOT NULL,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
     """)
     cur.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)", (str(QSQL_SCHEMA),))
     conn.commit()
@@ -642,6 +655,14 @@ def load_memory_sqlite(mw, path, periodic=None, chambers=None):
                 avg_res = sum(row[0] for row in chunk_rows) / len(chunk_rows)
                 chambers.act[CH_CMPLX] = clampf(max(chambers.act[CH_CMPLX], 0.04 * avg_res), 0.0, 1.0)
                 chambers.act[CH_FLOW] = clampf(max(chambers.act[CH_FLOW], 0.03 * avg_res), 0.0, 1.0)
+            parl_rows = list(cur.execute("SELECT diversity,avg_vitality,consolidations FROM parliament_events ORDER BY id DESC LIMIT 12"))
+            if parl_rows:
+                avg_div = sum(row[0] for row in parl_rows) / len(parl_rows)
+                avg_vit = sum(row[1] for row in parl_rows) / len(parl_rows)
+                avg_cons = sum(row[2] for row in parl_rows) / len(parl_rows)
+                chambers.presence = clampf(max(chambers.presence, 0.22 * avg_vit + 0.04 * avg_cons), 0.0, 1.0)
+                chambers.act[CH_CMPLX] = clampf(max(chambers.act[CH_CMPLX], 0.18 * avg_div + 0.03 * avg_cons), 0.0, 1.0)
+                chambers.act[CH_FLOW] = clampf(max(chambers.act[CH_FLOW], 0.12 * avg_vit), 0.0, 1.0)
         conn.close()
         return True
     except Exception:
@@ -694,6 +715,10 @@ def save_memory_sqlite(mw, path, periodic=None, chambers=None, events=None):
         cur.executemany(
             "INSERT INTO chunk_events(episode_id,step,doc_name,chunk_start,resonance) VALUES(?,?,?,?,?)",
             [(episode_id, ev["step"], ev.get("doc_name"), ev["chunk_start"], ev["resonance"]) for ev in events.get("chunks", [])]
+        )
+        cur.executemany(
+            "INSERT INTO parliament_events(episode_id,step,experts,winners,diversity,avg_vitality,births,deaths,consolidations) VALUES(?,?,?,?,?,?,?,?,?)",
+            [(episode_id, ev["step"], ev["experts"], ev["winners"], ev["diversity"], ev["avg_vitality"], ev["births"], ev["deaths"], ev["consolidations"]) for ev in events.get("parliament", [])]
         )
     conn.commit()
     conn.close()
@@ -1396,6 +1421,8 @@ class Parliament:
         self.last_entropy = 0.0
         self.last_diversity = 0.0
         self.last_winners = []
+        self.last_births = 0
+        self.last_deaths = 0
         self.last_consolidations = 0
 def parl_init(p, d_model, n_init):
     p.d_model = d_model
@@ -1405,6 +1432,8 @@ def parl_init(p, d_model, n_init):
     p.last_entropy = 0.0
     p.last_diversity = 0.0
     p.last_winners = []
+    p.last_births = 0
+    p.last_deaths = 0
     p.last_consolidations = 0
     p.n = min(n_init, MAX_EXPERTS)
     p.ex = []
@@ -1513,6 +1542,7 @@ def parl_notorch(p, x, debt, dlen):
         p.ex[i].age += 1
 def parl_lifecycle(p):
     # apoptosis
+    before = p.n
     alive = []
     for i in range(p.n):
         if p.ex[i].low_steps >= 12 and p.ex[i].vitality < 0.06 and abs(p.ex[i].resonance) < 0.05 and p.ex[i].age > 28 and p.n > 2:
@@ -1520,6 +1550,7 @@ def parl_lifecycle(p):
         alive.append(p.ex[i])
     p.ex = alive
     p.n = len(alive)
+    p.last_deaths = max(0, before - p.n)
     # mitosis
     births = []
     for i in range(p.n):
@@ -1540,6 +1571,7 @@ def parl_lifecycle(p):
             p.ex[i].overload *= 0.5
     p.ex.extend(births)
     p.n = len(p.ex)
+    p.last_births = len(births)
     p.step += 1
 # ── Transformer ──
 class TFLayer:
@@ -2133,7 +2165,7 @@ def gen_chain(t, bpe, mw, ch, cids, clen, has_weights, parl, periodic=None, inte
     print("  chambers: %s" % ch.summary())
     if parl is not None:
         av = sum(e.vitality for e in parl.ex) / (parl.n if parl.n > 0 else 1)
-        print("  parliament: %d experts, avg_vitality=%.2f" % (parl.n, av))
+        print("  parliament: %d experts, avg_vitality=%.2f div=%.2f winners=%d cons=%d" % (parl.n, av, parl.last_diversity, len(parl.last_winners), parl.last_consolidations))
     if interference is not None and interference.docs:
         print("  interference: %d docs loaded" % len(interference.docs))
     print()
@@ -2293,6 +2325,9 @@ def gen_chain(t, bpe, mw, ch, cids, clen, has_weights, parl, periodic=None, inte
         chain_ids[si] = list(best_out)
         chain_lens[si] = best_ol
         events["prophecies"].append({"step": si, "pressure": prophecy_pressure(mw), "debt": ch.debt})
+        if parl is not None:
+            av = sum(e.vitality for e in parl.ex) / (parl.n if parl.n > 0 else 1)
+            events["parliament"].append({"step": si, "experts": parl.n, "winners": len(parl.last_winners), "diversity": parl.last_diversity, "avg_vitality": av, "births": parl.last_births, "deaths": parl.last_deaths, "consolidations": parl.last_consolidations})
         ch_xfire(ch, 3)
         ch.debt = 0.9 * ch.debt + 0.05
 

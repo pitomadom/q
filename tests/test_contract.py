@@ -276,6 +276,7 @@ class UnifiedContractTests(unittest.TestCase):
         events["prophecies"].append({"step": 5, "pressure": 0.31, "debt": 0.22})
         events["phases"].append({"step": 0, "phase": "flow", "flow": 0.3, "fear": 0.1, "void": 0.05, "complexity": 0.2})
         events["chunks"].append({"step": 2, "doc_name": "dario_essay.txt", "chunk_start": 32, "resonance": 6.0})
+        events["parliament"].append({"step": 4, "experts": 4, "winners": 2, "diversity": 0.6, "avg_vitality": 0.8, "births": 1, "deaths": 0, "consolidations": 2})
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "q.sqlite")
             q.save_memory_sqlite(mw, path, q.PeriodicTable(), ch, events)
@@ -287,6 +288,7 @@ class UnifiedContractTests(unittest.TestCase):
             self.assertEqual(cur.execute("SELECT COUNT(*) FROM prophecy_events").fetchone()[0], 1)
             self.assertEqual(cur.execute("SELECT COUNT(*) FROM phase_events").fetchone()[0], 1)
             self.assertEqual(cur.execute("SELECT COUNT(*) FROM chunk_events").fetchone()[0], 1)
+            self.assertEqual(cur.execute("SELECT COUNT(*) FROM parliament_events").fetchone()[0], 1)
             conn.close()
 
             loaded_mw = q.MetaW()

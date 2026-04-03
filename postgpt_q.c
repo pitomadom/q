@@ -362,12 +362,14 @@ typedef struct{int step; int success; float coherence,debt;}WormholeEvent;
 typedef struct{int step; float pressure,debt;}ProphecyEvent;
 typedef struct{int step; char phase[12]; float flow,fear,voidv,complexity;}PhaseEvent;
 typedef struct{int step; char doc_name[64]; int chunk_start; float resonance;}ChunkEvent;
+typedef struct{int step,experts,winners,births,deaths,consolidations; float diversity,avg_vitality;}ParliamentEvent;
 typedef struct{
     ScarEvent scars[128]; int n_scars;
     WormholeEvent wormholes[256]; int n_wormholes;
     ProphecyEvent prophecies[512]; int n_prophecies;
     PhaseEvent phases[256]; int n_phases;
     ChunkEvent chunks[256]; int n_chunks;
+    ParliamentEvent parliament[256]; int n_parliament;
 }ExperienceLog;
 static ExperienceLog QEXP={0};
 
@@ -418,6 +420,10 @@ static void qexp_add_chunk(int step, const char *doc_name, int chunk_start, floa
     ChunkEvent *e=&QEXP.chunks[QEXP.n_chunks++];
     memset(e,0,sizeof(*e)); e->step=step; e->chunk_start=chunk_start; e->resonance=resonance;
     if(doc_name) snprintf(e->doc_name,sizeof(e->doc_name),"%s",doc_name);
+}
+static void qexp_add_parliament(int step, int experts, int winners, float diversity, float avg_vitality, int births, int deaths, int consolidations){
+    if(QEXP.n_parliament>=256) return;
+    QEXP.parliament[QEXP.n_parliament++] = (ParliamentEvent){step,experts,winners,births,deaths,consolidations,diversity,avg_vitality};
 }
 static void consolidate_experience(MetaW *mw, PeriodicTable *pt, Chambers *ch){
     float scar_avg=0, worm_success=0, worm_coh=0, prop_avg=0, chunk_avg=0;
@@ -806,7 +812,7 @@ typedef struct{
 typedef struct{
     Expert ex[MAX_EXPERTS]; int n;
     int d_model; float alpha;
-    int step,last_k,last_winners[MAX_EXPERTS],n_winners,last_consolidations; float last_entropy,last_diversity;
+    int step,last_k,last_winners[MAX_EXPERTS],n_winners,last_consolidations,last_births,last_deaths; float last_entropy,last_diversity;
 }Parliament;
 
 static void expert_init(Expert *e, int d_in, int d_out, int rank){
@@ -858,7 +864,7 @@ static int expert_consolidate(Expert *e){
 }
 
 static void parl_init(Parliament *p, int d_model, int n_init){
-    p->d_model=d_model;p->alpha=DOE_ALPHA;p->step=0;p->last_k=0;p->last_entropy=0;p->last_diversity=0;p->n_winners=0;p->last_consolidations=0;
+    p->d_model=d_model;p->alpha=DOE_ALPHA;p->step=0;p->last_k=0;p->last_entropy=0;p->last_diversity=0;p->n_winners=0;p->last_consolidations=0;p->last_births=0;p->last_deaths=0;
     p->n=n_init<MAX_EXPERTS?n_init:MAX_EXPERTS;
     for(int i=0;i<p->n;i++) expert_init(&p->ex[i],d_model,d_model,DOE_RANK);
 }
@@ -953,13 +959,13 @@ static void parl_notorch(Parliament *p, const float *x, const float *debt, int d
 
 static void parl_lifecycle(Parliament *p){
     /* apoptosis */
-    int alive=0;
+    int alive=0,before=p->n;
     for(int i=0;i<p->n;i++){
         if(p->ex[i].low_steps>=12&&p->ex[i].vitality<0.06f&&fabsf(p->ex[i].resonance)<0.05f&&p->n>2&&p->ex[i].age>28){
             free(p->ex[i].A);free(p->ex[i].B);free(p->ex[i].trace);continue;}
         if(alive!=i) p->ex[alive]=p->ex[i];alive++;
     }
-    p->n=alive;
+    p->n=alive; p->last_deaths=before-p->n;
     /* mitosis */
     int births=0;
     for(int i=0;i<p->n&&p->n+births<MAX_EXPERTS;i++){
@@ -973,7 +979,7 @@ static void parl_lifecycle(Parliament *p){
             p->ex[i].overload*=0.5f;
         }
     }
-    p->n+=births;p->step++;
+    p->n+=births; p->last_births=births; p->step++;
 }
 
 /* ── Transformer ── */
@@ -1503,6 +1509,7 @@ static void gen_chain(TF *t, const BPE *bpe, MetaW *mw, Chambers *ch,
         /* save for SPA */
         chain_lens[si]=best_ol; memcpy(chain_ids[si],best_out,best_ol*sizeof(int));
         qexp_add_prophecy(si,prophecy_pressure(mw),ch->debt);
+        if(parl){ float av=0; for(int i=0;i<parl->n;i++) av+=parl->ex[i].vitality; av/=(parl->n>0?parl->n:1); qexp_add_parliament(si,parl->n,parl->n_winners,parl->last_diversity,av,parl->last_births,parl->last_deaths,parl->last_consolidations); }
         ch_xfire(ch,3); ch->debt=0.9f*ch->debt+0.05f; if(doc_signal) free(doc_signal);
     }
     /* SPA: iterative cross-attention — reseed weak sentences, verify improvement */
@@ -1634,6 +1641,11 @@ static int qsqlite_load(MetaW *mw, const char *path, PeriodicTable *pt, Chambers
     {float sum=0; int n=0; while(fgets(line,sizeof(line),fp)){ sum+=atof(line); n++; }
     if(n>0){ float avg=sum/n; float complex_t=0.04f*avg, flow_t=0.03f*avg; ch->act[CH_CMPLX]=clampf(ch->act[CH_CMPLX]>complex_t?ch->act[CH_CMPLX]:complex_t,0,1); ch->act[CH_FLOW]=clampf(ch->act[CH_FLOW]>flow_t?ch->act[CH_FLOW]:flow_t,0,1); }}
     pclose(fp);
+    snprintf(cmd,sizeof(cmd),"sqlite3 -tabs -noheader '%s' \"SELECT diversity,avg_vitality,consolidations FROM parliament_events ORDER BY id DESC LIMIT 12;\"",path);
+    fp=popen(cmd,"r"); if(!fp) return 0;
+    {float sum_div=0,sum_vit=0,sum_cons=0; int n=0; while(fgets(line,sizeof(line),fp)){ float div=0,vit=0,cons=0; if(sscanf(line,"%f\t%f\t%f",&div,&vit,&cons)==3){ sum_div+=div; sum_vit+=vit; sum_cons+=cons; n++; }}
+    if(n>0){ float avg_div=sum_div/n, avg_vit=sum_vit/n, avg_cons=sum_cons/n; ch->presence=clampf(ch->presence>(0.22f*avg_vit+0.04f*avg_cons)?ch->presence:(0.22f*avg_vit+0.04f*avg_cons),0,1); ch->act[CH_CMPLX]=clampf(ch->act[CH_CMPLX]>(0.18f*avg_div+0.03f*avg_cons)?ch->act[CH_CMPLX]:(0.18f*avg_div+0.03f*avg_cons),0,1); ch->act[CH_FLOW]=clampf(ch->act[CH_FLOW]>(0.12f*avg_vit)?ch->act[CH_FLOW]:(0.12f*avg_vit),0,1); }}
+    pclose(fp);
     return 1;
 }
 
@@ -1656,6 +1668,7 @@ static int qsqlite_save(const MetaW *mw, const char *path, const PeriodicTable *
         "CREATE TABLE IF NOT EXISTS prophecy_events(id INTEGER PRIMARY KEY AUTOINCREMENT,episode_id INTEGER NOT NULL,step INTEGER NOT NULL,pressure REAL NOT NULL,debt REAL NOT NULL,created_at TEXT DEFAULT CURRENT_TIMESTAMP);\n"
         "CREATE TABLE IF NOT EXISTS phase_events(id INTEGER PRIMARY KEY AUTOINCREMENT,episode_id INTEGER NOT NULL,step INTEGER NOT NULL,phase TEXT NOT NULL,flow REAL NOT NULL,fear REAL NOT NULL,void REAL NOT NULL,complexity REAL NOT NULL,created_at TEXT DEFAULT CURRENT_TIMESTAMP);\n"
         "CREATE TABLE IF NOT EXISTS chunk_events(id INTEGER PRIMARY KEY AUTOINCREMENT,episode_id INTEGER NOT NULL,step INTEGER NOT NULL,doc_name TEXT,chunk_start INTEGER NOT NULL,resonance REAL NOT NULL,created_at TEXT DEFAULT CURRENT_TIMESTAMP);\n"
+        "CREATE TABLE IF NOT EXISTS parliament_events(id INTEGER PRIMARY KEY AUTOINCREMENT,episode_id INTEGER NOT NULL,step INTEGER NOT NULL,experts INTEGER NOT NULL,winners INTEGER NOT NULL,diversity REAL NOT NULL,avg_vitality REAL NOT NULL,births INTEGER NOT NULL,deaths INTEGER NOT NULL,consolidations INTEGER NOT NULL,created_at TEXT DEFAULT CURRENT_TIMESTAMP);\n"
         "INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version','1');\n"
         "DELETE FROM bigrams;DELETE FROM trigrams;DELETE FROM hebb;DELETE FROM prophecies;DELETE FROM periodic_elements;DELETE FROM chambers;\n");
     for(int i=0;i<mw->n_bi;i++) fprintf(sf,"INSERT INTO bigrams(a,b,prob) VALUES(%d,%d,%.9g);\n",mw->bigrams[i].a,mw->bigrams[i].b,mw->bigrams[i].prob);
@@ -1672,6 +1685,7 @@ static int qsqlite_save(const MetaW *mw, const char *path, const PeriodicTable *
     for(int i=0;i<QEXP.n_prophecies;i++) fprintf(sf,"INSERT INTO prophecy_events(episode_id,step,pressure,debt) VALUES((SELECT MAX(id) FROM episodes),%d,%.9g,%.9g);\n",QEXP.prophecies[i].step,QEXP.prophecies[i].pressure,QEXP.prophecies[i].debt);
     for(int i=0;i<QEXP.n_phases;i++){ char phase[32]; qsqlite_escape(QEXP.phases[i].phase,phase,sizeof(phase)); fprintf(sf,"INSERT INTO phase_events(episode_id,step,phase,flow,fear,void,complexity) VALUES((SELECT MAX(id) FROM episodes),%d,'%s',%.9g,%.9g,%.9g,%.9g);\n",QEXP.phases[i].step,phase,QEXP.phases[i].flow,QEXP.phases[i].fear,QEXP.phases[i].voidv,QEXP.phases[i].complexity); }
     for(int i=0;i<QEXP.n_chunks;i++){ char doc[96]; qsqlite_escape(QEXP.chunks[i].doc_name,doc,sizeof(doc)); fprintf(sf,"INSERT INTO chunk_events(episode_id,step,doc_name,chunk_start,resonance) VALUES((SELECT MAX(id) FROM episodes),%d,'%s',%d,%.9g);\n",QEXP.chunks[i].step,doc,QEXP.chunks[i].chunk_start,QEXP.chunks[i].resonance); }
+    for(int i=0;i<QEXP.n_parliament;i++) fprintf(sf,"INSERT INTO parliament_events(episode_id,step,experts,winners,diversity,avg_vitality,births,deaths,consolidations) VALUES((SELECT MAX(id) FROM episodes),%d,%d,%d,%.9g,%.9g,%d,%d,%d);\n",QEXP.parliament[i].step,QEXP.parliament[i].experts,QEXP.parliament[i].winners,QEXP.parliament[i].diversity,QEXP.parliament[i].avg_vitality,QEXP.parliament[i].births,QEXP.parliament[i].deaths,QEXP.parliament[i].consolidations);
     fprintf(sf,"COMMIT;\n");
     fclose(sf);
     char cmd[768];
