@@ -615,10 +615,10 @@ void test_smoke_run_weights(void) {
     system("head -c 5000 q.txt > /tmp/q_tiny.txt 2>/dev/null");
     int ret=system("gcc postgpt_q.c -O2 -lm -o /tmp/q_smoke 2>/dev/null");
     if(ret!=0){FAIL("compile");return;}
-    /* try rrpram3_janus3 if exists */
-    ret=system("test -f weights/rrpram3_janus3.bin");
+    /* try canonical exported runtime weights if present */
+    ret=system("test -f weights/exported_weights.bin");
     if(ret!=0){printf("SKIP (no .bin weights)\n");tests_passed++;return;}
-    ret=system("printf 'quit\n' | /tmp/q_smoke weights/rrpram3_janus3.bin q.merges /tmp/q_tiny.txt >/dev/null 2>&1");
+    ret=system("printf 'quit\n' | /tmp/q_smoke weights/exported_weights.bin q.merges /tmp/q_tiny.txt >/dev/null 2>&1");
     CHECK(ret==0, "runs with weights");
     remove("/tmp/q_smoke"); remove("/tmp/q_tiny.txt");
     PASS();

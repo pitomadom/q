@@ -236,6 +236,8 @@ Requires: `q.merges` (BPE merge table, binary) and `q.txt` (corpus).
 ```bash
 gcc tests/test_all.c -O2 -lm -o test_all && ./test_all    # 40 C tests
 python3 -m unittest tests.test_contract                     # 28 Python contract tests
+python3 tests/generation_regression.py                     # fast C meta/trained generation smoke
+python3 tests/generation_regression.py --deep              # slower Python parity smoke
 ```
 
 ## Example Output
