@@ -253,6 +253,34 @@ void test_memory(void) {
     PASS();
 }
 
+void test_legacy_memory_tail(void) {
+    TEST("legacy_memory_tail_compat");
+    uint32_t magic=0x514D454D;
+    FILE *f=fopen("/tmp/test_q_legacy.memory","wb");
+    CHECK(f!=NULL, "write open");
+    fwrite(&magic,4,1,f);
+    int nb=1,nt=0,nh=0;
+    fwrite(&nb,4,1,f); fwrite(&nt,4,1,f); fwrite(&nh,4,1,f);
+    int a=7,b=9; float p=0.25f;
+    fwrite(&a,4,1,f); fwrite(&b,4,1,f); fwrite(&p,4,1,f);
+    uint32_t npe=0;
+    fwrite(&npe,4,1,f);
+    fclose(f);
+    f=fopen("/tmp/test_q_legacy.memory","rb");
+    CHECK(f!=NULL, "read open");
+    uint32_t rm=0; int rnb=0,rnt=0,rnh=0;
+    fread(&rm,4,1,f); fread(&rnb,4,1,f); fread(&rnt,4,1,f); fread(&rnh,4,1,f);
+    CHECK(rm==magic, "magic");
+    CHECK(rnb==1&&rnt==0&&rnh==0, "counts");
+    fread(&a,4,1,f); fread(&b,4,1,f); fread(&p,4,1,f);
+    CHECK(a==7&&b==9, "pair");
+    CHECK(fabsf(p-0.25f)<1e-5f, "prob");
+    CHECK(fread(&npe,4,1,f)==1&&npe==0, "no periodic");
+    CHECK(fgetc(f)==EOF, "clean eof without soma tail");
+    fclose(f); remove("/tmp/test_q_legacy.memory");
+    PASS();
+}
+
 /* ── 10. Schumann ── */
 void test_schumann(void) {
     TEST("schumann_resonance");
@@ -443,6 +471,26 @@ void test_chamber_modulation(void) {
     PASS();
 }
 
+void test_somatic_modulation(void) {
+    TEST("somatic_modulation");
+    float act[6]={0.1f,0.4f,0.1f,0.1f,0.5f,0.2f};
+    float soma[6]={0.1f,0.8f,0.0f,0.0f,0.7f,0.3f};
+    float presence=0.6f;
+    float a=fminf(2.0f,fmaxf(0.3f,1.0f+0.4f*act[1]-0.2f*act[2]+0.3f*act[4]));
+    float b=fminf(2.0f,fmaxf(0.3f,1.0f+0.4f*act[4]-0.2f*act[0]));
+    float g=fminf(2.0f,fmaxf(0.3f,1.0f+0.5f*act[5]+0.2f*act[1]-0.1f*act[3]));
+    float t=fminf(2.0f,fmaxf(0.3f,1.0f-0.2f*act[4]+0.1f*act[0]));
+    a=fminf(2.0f,fmaxf(0.3f,a*fminf(1.5f,fmaxf(0.7f,1.0f+0.14f*soma[1]+0.08f*soma[4]+0.05f*presence))));
+    b=fminf(2.0f,fmaxf(0.3f,b*fminf(1.5f,fmaxf(0.7f,1.0f+0.10f*soma[4]+0.08f*soma[5]+0.04f*presence))));
+    g=fminf(2.0f,fmaxf(0.3f,g*fminf(1.5f,fmaxf(0.7f,1.0f+0.10f*soma[5]+0.05f*soma[3]+0.06f*presence))));
+    t=fminf(2.0f,fmaxf(0.3f,t*fminf(1.5f,fmaxf(0.7f,1.0f-0.10f*soma[4]+0.08f*soma[0]+0.06f*soma[2]))));
+    CHECK(a>1.5f, "love-flow soma boosts alpha");
+    CHECK(b>1.2f, "flow-complex soma boosts beta");
+    CHECK(g>1.2f, "presence boosts gamma");
+    CHECK(t<1.0f, "flow cools tau");
+    PASS();
+}
+
 /* ── 23. Periodic mapping ── */
 void test_periodic_mapping(void) {
     TEST("periodic_mapping");
@@ -518,6 +566,7 @@ int main(void) {
     test_boundary();
     test_coherence();
     test_memory();
+    test_legacy_memory_tail();
     test_schumann();
     test_nucleus();
     test_prophecy();
@@ -530,6 +579,7 @@ int main(void) {
     test_hebbian_decay();
     test_bigram_blocking();
     test_chamber_modulation();
+    test_somatic_modulation();
     test_periodic_mapping();
     test_interference_seed();
     test_smoke_compile();
