@@ -1236,6 +1236,16 @@ function anchoredPromptFromInput(text,maxTokens=4){
   }
   return inpIds.slice(start,Math.min(inpIds.length,start+maxTokens));
 }
+function earlySentenceQuality(ids){
+  if(!ids.length)return-1;
+  let score=surfaceCoherenceScore(ids);
+  if(ids.length<8)score-=0.4;
+  if(!bpe.isCleanSeedToken(ids[0]))score-=0.6;
+  const text=bpe.decode(ids.slice(0,10)).replace(/^\s+/,'');
+  if(text.length>=2&&text[0]>='a'&&text[0]<='z')score-=0.4;
+  if(text.includes('...'))score-=0.2;
+  return score;
+}
 
 // zero token embedding table for MetaWeights-only mode (matches C zero-weight fallback)
 let _zeroTokCache=null;
@@ -1566,13 +1576,19 @@ function generateChain(inputText){
 
     // best of 3
     let bestOut=null,bestSc=-Infinity;
+    let bestQ=-Infinity;
     const gdestSave=new Float32Array(gdest);
-    for(let cand=0;cand<3;cand++){
+    const candTrials=!tf.loaded&&si<=1?5:3;
+    for(let cand=0;cand<candTrials;cand++){
       if(cand>0)gdest.set(gdestSave);
-      const o=genSentence(prompt,temp,gdest,velocity);
+      let candTemp=temp;
+      if(!tf.loaded&&si<=1&&cand>0)candTemp=Math.max(0.28,Math.min(temp,temp*(0.92-0.06*Math.min(cand,3))));
+      const o=genSentence(prompt,candTemp,gdest,velocity);
       const sc=coherenceScore(o)+0.6*surfaceCoherenceScore(o);
+      const qSc=!tf.loaded&&si<=1?earlySentenceQuality(o):sc;
+      if(qSc>bestQ)bestQ=qSc;
       if(sc>bestSc){bestSc=sc;bestOut=o;}
-      if(bestSc>1&&bestOut.length>12)break;
+      if(bestQ>0.1&&bestSc>1&&bestOut.length>12)break;
     }
 
     let wormhole=false;

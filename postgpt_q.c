@@ -1175,6 +1175,21 @@ static int anchored_prompt_from_input(const BPE *bpe, const char *text, int *out
     for(int i=0;i<n;i++) out[i]=inp_ids[start+i];
     return n;
 }
+static float early_sentence_quality(const BPE *bpe, const int *ids, int n){
+    if(n<=0) return -1.0f;
+    float score=surface_coherence_score(bpe,ids,n);
+    if(n<8) score-=0.4f;
+    if(!is_clean_seed_token(bpe,ids[0])) score-=0.6f;
+    char text[256]={0}; int pos=0;
+    for(int i=0;i<n&&i<10;i++){
+        char buf[64]; int len=bpe_decode_token(bpe,ids[i],buf,sizeof(buf));
+        if(len>0&&pos+len<(int)sizeof(text)-1){memcpy(text+pos,buf,len);pos+=len;text[pos]=0;}
+    }
+    char *p=text; while(*p&&isspace((unsigned char)*p)) p++;
+    if(p[0]&&p[1]&&islower((unsigned char)p[0])) score-=0.4f;
+    if(strstr(p,"...")) score-=0.2f;
+    return score;
+}
 
 /* ── boundary check ── */
 static int is_boundary(const BPE *bpe, int id){
@@ -1554,13 +1569,19 @@ static void gen_chain(TF *t, const BPE *bpe, MetaW *mw, Chambers *ch,
         float temp=clampf((base_temp+0.08f*schumann)*vel.temp_mul,0.35f,0.95f);
         /* best-of-3: generate 3 candidates, pick highest coherence */
         int best_out[256],best_ol=0; float best_sc=-1e30f;
+        float best_q=-1e30f;
         float gdest_save[256]; if(t->D<=256) memcpy(gdest_save,gdest,t->D*sizeof(float));
-        for(int cand=0;cand<3;cand++){
+        int cand_trials=(!has_weights&&si<=1)?5:3;
+        for(int cand=0;cand<cand_trials;cand++){
             if(cand>0&&t->D<=256) memcpy(gdest,gdest_save,t->D*sizeof(float)); /* restore destiny */
-            int out[256],ol=gen_sent(t,bpe,mw,prompt,plen,temp,out,256,parl,gdest,ch,&vel,doc_signal);
+            float cand_temp=temp;
+            if(!has_weights&&si<=1&&cand>0) cand_temp=clampf(temp*(0.92f-0.06f*(float)(cand<3?cand:3)),0.28f,temp);
+            int out[256],ol=gen_sent(t,bpe,mw,prompt,plen,cand_temp,out,256,parl,gdest,ch,&vel,doc_signal);
             float sc=coherence_score(mw,out,ol,t->V)+0.6f*surface_coherence_score(bpe,out,ol);
+            float q_sc=(!has_weights&&si<=1)?early_sentence_quality(bpe,out,ol):sc;
+            if(q_sc>best_q) best_q=q_sc;
             if(sc>best_sc){best_sc=sc;best_ol=ol;memcpy(best_out,out,ol*sizeof(int));}
-            if(best_sc>1.0f&&best_ol>12) break; /* early exit if first candidate is strong */
+            if(best_q>0.1f&&best_sc>1.0f&&best_ol>12) break; /* early exit if first candidate is strong */
         }
         int wormhole=0;
         if(si<CHAIN_STEPS-1){

@@ -1878,6 +1878,20 @@ def anchored_prompt_from_input(bpe, text, max_tokens=4):
                     break
     end = min(len(inp_ids), start + max_tokens)
     return inp_ids[start:end] if end > start else None
+def early_sentence_quality(bpe, ids):
+    if not ids:
+        return -1.0
+    score = surface_coherence_score(bpe, ids)
+    if len(ids) < 8:
+        score -= 0.4
+    if not is_clean_seed_token(bpe, ids[0]):
+        score -= 0.6
+    text = "".join(bpe_decode_token(bpe, tid) for tid in ids[:10]).lstrip()
+    if len(text) >= 2 and text[0].islower():
+        score -= 0.4
+    if text.count("...") > 0:
+        score -= 0.2
+    return score
 # ── boundary check ──
 def is_boundary(bpe, tid):
     if tid < 0 or tid >= bpe.vocab_size:
@@ -2360,16 +2374,24 @@ def gen_chain(t, bpe, mw, ch, cids, clen, has_weights, parl, periodic=None, inte
         best_sc = -1e30
         gdest_save = list(gdest) if t.D <= 256 else None
 
-        for cand in range(3):
+        cand_trials = 5 if (not has_weights and si <= 1) else 3
+        best_q = -1e30
+        for cand in range(cand_trials):
             if cand > 0 and gdest_save is not None:
                 gdest[:] = list(gdest_save)
-            result = gen_sent(t, bpe, mw, prompt, pl, temp, 256, parl, gdest, ch, vel, doc_signal)
+            cand_temp = temp
+            if not has_weights and si <= 1 and cand > 0:
+                cand_temp = clampf(temp * (0.92 - 0.06 * min(cand, 3)), 0.28, temp)
+            result = gen_sent(t, bpe, mw, prompt, pl, cand_temp, 256, parl, gdest, ch, vel, doc_signal)
             sc = coherence_score(mw, result, len(result), t.V) + 0.6 * surface_coherence_score(bpe, result)
+            q_sc = early_sentence_quality(bpe, result) if (not has_weights and si <= 1) else sc
+            if q_sc > best_q:
+                best_q = q_sc
             if sc > best_sc:
                 best_sc = sc
                 best_ol = len(result)
                 best_out = list(result)
-            if best_sc > 1.0 and best_ol > 12:
+            if best_q > 0.1 and best_sc > 1.0 and best_ol > 12:
                 break
 
         wormhole = False

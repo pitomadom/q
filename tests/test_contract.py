@@ -167,6 +167,18 @@ class UnifiedContractTests(unittest.TestCase):
             q.bpe_encode = original
         self.assertEqual(anchored, [2, 3])
 
+    def test_early_sentence_quality_penalizes_fragmentary_starts(self):
+        bpe = q.BPE()
+        bpe.vocab_size = 3
+        bpe.vocab_bytes = {
+            0: b"atable",
+            1: b" clarity",
+            2: b" grows",
+        }
+        bad = q.early_sentence_quality(bpe, [0, 2])
+        good = q.early_sentence_quality(bpe, [1, 2, 1, 2, 1, 2, 1, 2])
+        self.assertLess(bad, good)
+
     def test_parliament_tracks_entropy_and_variable_k(self):
         p = q.Parliament()
         q.parl_init(p, 4, 4)
