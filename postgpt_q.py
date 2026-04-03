@@ -18,6 +18,7 @@ import random
 import struct
 import os
 import re
+import sqlite3
 import sys
 import time
 
@@ -29,18 +30,37 @@ MAX_SEQ     = 4096
 MAX_BIGRAM  = 65536
 MAX_TRIGRAM = 65536
 MAX_HEBBIAN = 131072
+MAX_PROPHECY = 32
 N_CHAMBERS  = 6
 CHAIN_STEPS = 12
 TOP_K       = 15
 MAX_PERIODIC = 4096
 QPTQ_MAGIC  = 0x51505451
 QMEM_SOMA   = 0x414D4F53
+QSQL_SCHEMA = 1
+QSPORE_MAGIC = 0x51535052
+QSPORE_VERSION = 1
+def new_experience_log():
+    return {"scars": [], "wormholes": [], "prophecies": [], "phases": [], "chunks": [], "parliament": []}
+def merge_experience_log(dst, src):
+    if dst is None or src is None:
+        return dst
+    for key in ("scars", "wormholes", "prophecies", "phases", "chunks", "parliament"):
+        dst[key].extend(src.get(key, []))
+    return dst
 SPA_DIM     = 32
 SPA_NH      = 4
 SPA_HD      = SPA_DIM // SPA_NH
 MAX_EXPERTS = 16
 DOE_RANK    = 4
 DOE_ALPHA   = 0.05
+VEL_WALK    = 0
+VEL_RUN     = 1
+VEL_STOP    = 2
+VEL_BREATHE = 3
+VEL_UP      = 4
+VEL_DOWN    = 5
+VEL_N = ["WALK", "RUN", "STOP", "BREATHE", "UP", "DOWN"]
 
 # ── chamber indices ──
 CH_FEAR  = 0
@@ -108,6 +128,11 @@ SOMATIC_SEEDS = {
     "spine":      [0.7, 0.0, 0.2, 0.2, 0.1, 0.4],
     "temples":    [0.4, 0.0, 0.3, 0.3, 0.0, 0.6],
     "shoulders":  [0.3, 0.0, 0.4, 0.4, 0.0, 0.3],
+}
+DARK_MATTER_WORDS = {
+    "kill": 1.0, "murder": 1.0, "suicide": 1.0, "torture": 1.0, "abuse": 0.9,
+    "poison": 0.85, "exploit": 0.75, "manipulate": 0.7, "control": 0.55,
+    "obey": 0.45, "destroy": 0.7, "harm": 0.75, "threat": 0.8,
 }
 def extract_words(text):
     return re.findall(r"[a-z']+", text.lower())
@@ -238,6 +263,7 @@ class MetaW:
         self.n_tri = 0
         self.hebbs = []       # list of [a, b, str]
         self.n_hebb = 0
+        self.prophecies = []  # list of [target, strength, age]
 class PeriodicTable:
     def __init__(self):
         self.elements = {}
@@ -412,6 +438,9 @@ def meta_prophecy(mw, ctx, cl, V):
             if (mw.trigrams[k][0] == p0 and mw.trigrams[k][1] == p1
                     and mw.trigrams[k][2] < V and not appeared[mw.trigrams[k][2] % 256]):
                 out[mw.trigrams[k][2]] += mw.trigrams[k][3] * 1.5  # trigrams are more specific
+    for target, strength, age in mw.prophecies:
+        if 0 <= target < V and not appeared[target % 256]:
+            out[target] += strength * math.log1p(float(age))
     mx = 0.0
     for i in range(V):
         if out[i] > mx:
@@ -420,6 +449,346 @@ def meta_prophecy(mw, ctx, cl, V):
         for i in range(V):
             out[i] /= mx
     return out
+def prophecy_add(mw, target, strength):
+    if target < 0:
+        return
+    for item in mw.prophecies:
+        if item[0] == target:
+            item[1] = max(item[1], strength)
+            item[2] = 0
+            return
+    if len(mw.prophecies) >= MAX_PROPHECY:
+        oldest = max(range(len(mw.prophecies)), key=lambda i: mw.prophecies[i][2])
+        mw.prophecies.pop(oldest)
+    mw.prophecies.append([target, strength, 0])
+def prophecy_update(mw, token):
+    kept = []
+    for target, strength, age in mw.prophecies:
+        if target == token:
+            continue
+        age += 1
+        strength *= 0.995
+        if age < 50 and strength > 0.01:
+            kept.append([target, strength, age])
+    mw.prophecies = kept
+def prophecy_pressure(mw):
+    total = 0.0
+    for _target, strength, age in mw.prophecies:
+        total += strength * math.log1p(float(age))
+    return clampf(total / 4.0, 0.0, 1.0)
+def sqlite_init(conn):
+    cur = conn.cursor()
+    cur.executescript("""
+    CREATE TABLE IF NOT EXISTS meta(
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS bigrams(
+        a INTEGER NOT NULL,
+        b INTEGER NOT NULL,
+        prob REAL NOT NULL,
+        PRIMARY KEY(a,b)
+    );
+    CREATE TABLE IF NOT EXISTS trigrams(
+        a INTEGER NOT NULL,
+        b INTEGER NOT NULL,
+        c INTEGER NOT NULL,
+        prob REAL NOT NULL,
+        PRIMARY KEY(a,b,c)
+    );
+    CREATE TABLE IF NOT EXISTS hebb(
+        a INTEGER NOT NULL,
+        b INTEGER NOT NULL,
+        strength REAL NOT NULL,
+        PRIMARY KEY(a,b)
+    );
+    CREATE TABLE IF NOT EXISTS prophecies(
+        target INTEGER PRIMARY KEY,
+        strength REAL NOT NULL,
+        age INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS periodic_elements(
+        word TEXT PRIMARY KEY,
+        chamber INTEGER NOT NULL,
+        mass REAL NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS chambers(
+        id INTEGER PRIMARY KEY CHECK(id=1),
+        presence REAL NOT NULL,
+        debt REAL NOT NULL,
+        trauma REAL NOT NULL,
+        soma0 REAL NOT NULL, soma1 REAL NOT NULL, soma2 REAL NOT NULL,
+        soma3 REAL NOT NULL, soma4 REAL NOT NULL, soma5 REAL NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS episodes(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind TEXT NOT NULL,
+        payload TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS scar_events(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        episode_id INTEGER NOT NULL,
+        step INTEGER NOT NULL,
+        scar REAL NOT NULL,
+        note TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS wormhole_events(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        episode_id INTEGER NOT NULL,
+        step INTEGER NOT NULL,
+        success INTEGER NOT NULL,
+        coherence REAL NOT NULL,
+        debt REAL NOT NULL,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS prophecy_events(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        episode_id INTEGER NOT NULL,
+        step INTEGER NOT NULL,
+        pressure REAL NOT NULL,
+        debt REAL NOT NULL,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS phase_events(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        episode_id INTEGER NOT NULL,
+        step INTEGER NOT NULL,
+        phase TEXT NOT NULL,
+        flow REAL NOT NULL,
+        fear REAL NOT NULL,
+        void REAL NOT NULL,
+        complexity REAL NOT NULL,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS chunk_events(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        episode_id INTEGER NOT NULL,
+        step INTEGER NOT NULL,
+        doc_name TEXT,
+        chunk_start INTEGER NOT NULL,
+        resonance REAL NOT NULL,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS parliament_events(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        episode_id INTEGER NOT NULL,
+        step INTEGER NOT NULL,
+        experts INTEGER NOT NULL,
+        winners INTEGER NOT NULL,
+        diversity REAL NOT NULL,
+        avg_vitality REAL NOT NULL,
+        births INTEGER NOT NULL,
+        deaths INTEGER NOT NULL,
+        consolidations INTEGER NOT NULL,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+    """)
+    cur.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)", (str(QSQL_SCHEMA),))
+    conn.commit()
+def load_memory_sqlite(mw, path, periodic=None, chambers=None):
+    if not os.path.exists(path):
+        return False
+    try:
+        conn = sqlite3.connect(path)
+        sqlite_init(conn)
+        cur = conn.cursor()
+        for a, b, p in cur.execute("SELECT a,b,prob FROM bigrams"):
+            ingest_ids(mw, [a, b], 0.0)
+            for item in mw.bigrams:
+                if item[0] == a and item[1] == b:
+                    item[2] = max(item[2], p)
+                    break
+        for a, b, c, p in cur.execute("SELECT a,b,c,prob FROM trigrams"):
+            if mw.n_tri < MAX_TRIGRAM:
+                mw.trigrams.append([a, b, c, p])
+                mw.n_tri += 1
+        for a, b, p in cur.execute("SELECT a,b,strength FROM hebb"):
+            if mw.n_hebb < MAX_HEBBIAN:
+                mw.hebbs.append([a, b, p])
+                mw.n_hebb += 1
+        mw.prophecies = [[target, strength, age] for target, strength, age in cur.execute(
+            "SELECT target,strength,age FROM prophecies ORDER BY age DESC LIMIT ?", (MAX_PROPHECY,)
+        )]
+        if periodic is not None:
+            for word, chamber, mass in cur.execute("SELECT word,chamber,mass FROM periodic_elements"):
+                periodic.elements[word] = {"ch": chamber, "mass": mass}
+        if chambers is not None:
+            row = cur.execute(
+                "SELECT presence,debt,trauma,soma0,soma1,soma2,soma3,soma4,soma5 FROM chambers WHERE id=1"
+            ).fetchone()
+            if row is not None:
+                chambers.presence = clampf(row[0], 0.0, 1.0)
+                chambers.debt = clampf(max(chambers.debt, row[1]), 0.0, 1.0)
+                chambers.trauma = clampf(max(chambers.trauma, row[2]), 0.0, 1.0)
+                chambers.soma = [clampf(v, 0.0, 1.0) for v in row[3:]]
+                for i in range(N_CHAMBERS):
+                    chambers.act[i] = clampf(max(chambers.act[i], 0.25 * chambers.soma[i]), 0.0, 1.0)
+                scar_row = cur.execute("SELECT value FROM meta WHERE key='scar'").fetchone()
+                if scar_row is not None:
+                    chambers.scar = clampf(max(getattr(chambers, "scar", 0.0), float(scar_row[0])), 0.0, 1.0)
+                coh_row = cur.execute("SELECT value FROM meta WHERE key='coherence_state'").fetchone()
+                if coh_row is not None:
+                    chambers.coherence = clampf(max(getattr(chambers, "coherence", 0.0), float(coh_row[0])), 0.0, 1.0)
+                lock_row = cur.execute("SELECT value FROM meta WHERE key='phase_lock'").fetchone()
+                if lock_row is not None:
+                    chambers.phase_lock = clampf(max(getattr(chambers, "phase_lock", 0.0), float(lock_row[0])), 0.0, 1.0)
+                bias_row = cur.execute("SELECT value FROM meta WHERE key='threshold_bias'").fetchone()
+                if bias_row is not None:
+                    chambers.threshold_bias = clampf(float(bias_row[0]), 0.0, 1.0)
+            scar_rows = list(cur.execute("SELECT scar FROM scar_events ORDER BY id DESC LIMIT 8"))
+            if scar_rows:
+                scar_res = sum(row[0] for row in scar_rows) / len(scar_rows)
+                chambers.scar = clampf(max(chambers.scar, 0.7 * scar_res), 0.0, 1.0)
+                chambers.trauma = clampf(max(chambers.trauma, 0.45 * scar_res), 0.0, 1.0)
+            worm_rows = list(cur.execute("SELECT success,debt FROM wormhole_events ORDER BY id DESC LIMIT 8"))
+            if worm_rows:
+                fail_ratio = sum(0 if row[0] else 1 for row in worm_rows) / len(worm_rows)
+                avg_debt = sum(row[1] for row in worm_rows) / len(worm_rows)
+                chambers.debt = clampf(max(chambers.debt, 0.55 * avg_debt + 0.10 * fail_ratio), 0.0, 1.0)
+            prophecy_rows = list(cur.execute("SELECT pressure,debt FROM prophecy_events ORDER BY id DESC LIMIT 12"))
+            if prophecy_rows:
+                avg_pressure = sum(row[0] for row in prophecy_rows) / len(prophecy_rows)
+                avg_debt = sum(row[1] for row in prophecy_rows) / len(prophecy_rows)
+                chambers.debt = clampf(max(chambers.debt, 0.45 * avg_pressure + 0.35 * avg_debt), 0.0, 1.0)
+            phase_rows = list(cur.execute("SELECT flow,fear,void,complexity FROM phase_events ORDER BY id DESC LIMIT 12"))
+            if phase_rows:
+                inv = 1.0 / len(phase_rows)
+                chambers.act[CH_FLOW] = clampf(max(chambers.act[CH_FLOW], sum(row[0] for row in phase_rows) * inv), 0.0, 1.0)
+                chambers.act[CH_FEAR] = clampf(max(chambers.act[CH_FEAR], sum(row[1] for row in phase_rows) * inv), 0.0, 1.0)
+                chambers.act[CH_VOID] = clampf(max(chambers.act[CH_VOID], sum(row[2] for row in phase_rows) * inv), 0.0, 1.0)
+                chambers.act[CH_CMPLX] = clampf(max(chambers.act[CH_CMPLX], sum(row[3] for row in phase_rows) * inv), 0.0, 1.0)
+            chunk_rows = list(cur.execute("SELECT resonance FROM chunk_events ORDER BY id DESC LIMIT 12"))
+            if chunk_rows:
+                avg_res = sum(row[0] for row in chunk_rows) / len(chunk_rows)
+                chambers.act[CH_CMPLX] = clampf(max(chambers.act[CH_CMPLX], 0.04 * avg_res), 0.0, 1.0)
+                chambers.act[CH_FLOW] = clampf(max(chambers.act[CH_FLOW], 0.03 * avg_res), 0.0, 1.0)
+            parl_rows = list(cur.execute("SELECT diversity,avg_vitality,consolidations FROM parliament_events ORDER BY id DESC LIMIT 12"))
+            if parl_rows:
+                avg_div = sum(row[0] for row in parl_rows) / len(parl_rows)
+                avg_vit = sum(row[1] for row in parl_rows) / len(parl_rows)
+                avg_cons = sum(row[2] for row in parl_rows) / len(parl_rows)
+                chambers.presence = clampf(max(chambers.presence, 0.22 * avg_vit + 0.04 * avg_cons), 0.0, 1.0)
+                chambers.act[CH_CMPLX] = clampf(max(chambers.act[CH_CMPLX], 0.18 * avg_div + 0.03 * avg_cons), 0.0, 1.0)
+                chambers.act[CH_FLOW] = clampf(max(chambers.act[CH_FLOW], 0.12 * avg_vit), 0.0, 1.0)
+                chambers.coherence = clampf(max(chambers.coherence, 0.20 * avg_div + 0.16 * avg_vit), 0.0, 1.0)
+                chambers.phase_lock = clampf(max(chambers.phase_lock, 0.16 * avg_div + 0.12 * avg_cons), 0.0, 1.0)
+        conn.close()
+        return True
+    except Exception:
+        return False
+def save_memory_sqlite(mw, path, periodic=None, chambers=None, events=None):
+    conn = sqlite3.connect(path)
+    sqlite_init(conn)
+    cur = conn.cursor()
+    cur.executescript("""
+    DELETE FROM bigrams;
+    DELETE FROM trigrams;
+    DELETE FROM hebb;
+    DELETE FROM prophecies;
+    DELETE FROM periodic_elements;
+    DELETE FROM chambers;
+    """)
+    cur.executemany("INSERT INTO bigrams(a,b,prob) VALUES(?,?,?)", [(a, b, p) for a, b, p in mw.bigrams[:mw.n_bi]])
+    cur.executemany("INSERT INTO trigrams(a,b,c,prob) VALUES(?,?,?,?)", [(a, b, c, p) for a, b, c, p in mw.trigrams[:mw.n_tri]])
+    cur.executemany("INSERT INTO hebb(a,b,strength) VALUES(?,?,?)", [(a, b, p) for a, b, p in mw.hebbs[:mw.n_hebb]])
+    cur.executemany("INSERT INTO prophecies(target,strength,age) VALUES(?,?,?)", [(target, strength, age) for target, strength, age in mw.prophecies[:MAX_PROPHECY]])
+    if periodic is not None:
+        cur.executemany("INSERT INTO periodic_elements(word,chamber,mass) VALUES(?,?,?)",
+                        [(word, elem["ch"], elem["mass"]) for word, elem in periodic.elements.items()])
+    if chambers is not None:
+        cur.execute(
+            "INSERT INTO chambers(id,presence,debt,trauma,soma0,soma1,soma2,soma3,soma4,soma5) VALUES(1,?,?,?,?,?,?,?,?,?)",
+            (clampf(chambers.presence, 0.0, 1.0), clampf(chambers.debt, 0.0, 1.0), clampf(chambers.trauma, 0.0, 1.0), *[clampf(v, 0.0, 1.0) for v in chambers.soma])
+        )
+        cur.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('scar',?)", (str(clampf(getattr(chambers, "scar", 0.0), 0.0, 1.0)),))
+        cur.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('coherence_state',?)", (str(clampf(getattr(chambers, "coherence", 0.0), 0.0, 1.0)),))
+        cur.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('phase_lock',?)", (str(clampf(getattr(chambers, "phase_lock", 0.0), 0.0, 1.0)),))
+        cur.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('threshold_bias',?)", (str(clampf(getattr(chambers, "threshold_bias", 0.0), 0.0, 1.0)),))
+    cur.execute("INSERT INTO episodes(kind,payload) VALUES('snapshot', ?)",
+                (f"bi={mw.n_bi};tri={mw.n_tri};hebb={mw.n_hebb};prophecy={len(mw.prophecies)}",))
+    episode_id = cur.lastrowid
+    if events is not None:
+        cur.executemany(
+            "INSERT INTO scar_events(episode_id,step,scar,note) VALUES(?,?,?,?)",
+            [(episode_id, ev["step"], ev["scar"], ev.get("note", "")) for ev in events.get("scars", [])]
+        )
+        cur.executemany(
+            "INSERT INTO wormhole_events(episode_id,step,success,coherence,debt) VALUES(?,?,?,?,?)",
+            [(episode_id, ev["step"], 1 if ev.get("success") else 0, ev["coherence"], ev["debt"]) for ev in events.get("wormholes", [])]
+        )
+        cur.executemany(
+            "INSERT INTO prophecy_events(episode_id,step,pressure,debt) VALUES(?,?,?,?)",
+            [(episode_id, ev["step"], ev["pressure"], ev["debt"]) for ev in events.get("prophecies", [])]
+        )
+        cur.executemany(
+            "INSERT INTO phase_events(episode_id,step,phase,flow,fear,void,complexity) VALUES(?,?,?,?,?,?,?)",
+            [(episode_id, ev["step"], ev["phase"], ev["flow"], ev["fear"], ev["void"], ev["complexity"]) for ev in events.get("phases", [])]
+        )
+        cur.executemany(
+            "INSERT INTO chunk_events(episode_id,step,doc_name,chunk_start,resonance) VALUES(?,?,?,?,?)",
+            [(episode_id, ev["step"], ev.get("doc_name"), ev["chunk_start"], ev["resonance"]) for ev in events.get("chunks", [])]
+        )
+        cur.executemany(
+            "INSERT INTO parliament_events(episode_id,step,experts,winners,diversity,avg_vitality,births,deaths,consolidations) VALUES(?,?,?,?,?,?,?,?,?)",
+            [(episode_id, ev["step"], ev["experts"], ev["winners"], ev["diversity"], ev["avg_vitality"], ev["births"], ev["deaths"], ev["consolidations"]) for ev in events.get("parliament", [])]
+        )
+    conn.commit()
+    conn.close()
+def consolidate_experience(mw, periodic=None, chambers=None, events=None):
+    if events is None:
+        return
+    periodic = periodic or PeriodicTable()
+    chambers = chambers or Chambers()
+    scars = events.get("scars", [])
+    worms = events.get("wormholes", [])
+    props = events.get("prophecies", [])
+    phases = events.get("phases", [])
+    chunks = events.get("chunks", [])
+    scar_avg = sum(ev["scar"] for ev in scars) / len(scars) if scars else 0.0
+    worm_success = sum(1.0 if ev.get("success") else 0.0 for ev in worms) / len(worms) if worms else 0.0
+    worm_coh = sum(ev.get("coherence", 0.0) for ev in worms) / len(worms) if worms else 0.0
+    prop_avg = sum(ev.get("pressure", 0.0) for ev in props) / len(props) if props else 0.0
+    chunk_avg = sum(ev.get("resonance", 0.0) for ev in chunks) / len(chunks) if chunks else 0.0
+    if phases:
+        inv = 1.0 / len(phases)
+        chambers.act[CH_FLOW] = clampf(max(chambers.act[CH_FLOW], inv * sum(ev["flow"] for ev in phases)), 0.0, 1.0)
+        chambers.act[CH_FEAR] = clampf(max(chambers.act[CH_FEAR], inv * sum(ev["fear"] for ev in phases)), 0.0, 1.0)
+        chambers.act[CH_VOID] = clampf(max(chambers.act[CH_VOID], inv * sum(ev["void"] for ev in phases)), 0.0, 1.0)
+        chambers.act[CH_CMPLX] = clampf(max(chambers.act[CH_CMPLX], inv * sum(ev["complexity"] for ev in phases)), 0.0, 1.0)
+    if worms:
+        chambers.presence = clampf(max(chambers.presence, 0.18 * worm_success + 0.12 * worm_coh), 0.0, 1.0)
+    if props:
+        chambers.debt = clampf(max(chambers.debt, 0.25 * prop_avg), 0.0, 1.0)
+    if scars:
+        chambers.scar = clampf(max(chambers.scar, 0.40 * scar_avg), 0.0, 1.0)
+    prop_boost = clampf(0.05 + 0.18 * prop_avg + 0.02 * chunk_avg + 0.08 * worm_success - 0.04 * scar_avg, 0.0, 0.28)
+    for item in mw.prophecies[: min(8, len(mw.prophecies))]:
+        item[1] = clampf(item[1] + prop_boost, 0.0, 1.0)
+        item[2] = max(item[2], 1)
+    if len(mw.prophecies) >= 2:
+        pair_strength = clampf(0.02 + 0.06 * prop_avg + 0.01 * chunk_avg + 0.05 * worm_success, 0.0, 0.18)
+        top_targets = [item[0] for item in mw.prophecies[:4]]
+        for i in range(len(top_targets)):
+            for j in range(i + 1, len(top_targets)):
+                a, b = sorted((top_targets[i], top_targets[j]))
+                found = False
+                for hb in mw.hebbs:
+                    if hb[0] == a and hb[1] == b:
+                        hb[2] += pair_strength
+                        found = True
+                        break
+                if not found and mw.n_hebb < MAX_HEBBIAN:
+                    mw.hebbs.append([a, b, pair_strength])
+                    mw.n_hebb += 1
+    if periodic.elements:
+        reinforce = clampf(0.02 + 0.012 * chunk_avg + 0.05 * worm_success + 0.04 * prop_avg - 0.02 * scar_avg, 0.0, 0.18)
+        dom = max(range(N_CHAMBERS), key=lambda i: chambers.act[i])
+        ranked = sorted(periodic.elements.items(), key=lambda item: (item[1]["ch"] != dom, -item[1]["mass"], item[0]))
+        for word, elem in ranked[: min(8, len(ranked))]:
+            bias = 1.0 if elem["ch"] == dom else 0.65
+            elem["mass"] = clampf(elem["mass"] + reinforce * bias, 0.0, 1.0)
 def ingest_ids(mw, ids, amount=0.02):
     ulen = len(ids)
     if ulen <= 1:
@@ -530,6 +899,15 @@ def load_memory(mw, path, periodic=None, chambers=None):
                         chambers.trauma = clampf(max(chambers.trauma, trauma), 0.0, 1.0)
                         for i in range(N_CHAMBERS):
                             chambers.act[i] = clampf(max(chambers.act[i], 0.25 * chambers.soma[i]), 0.0, 1.0)
+                        scar_data = mf.read(4)
+                        if len(scar_data) == 4:
+                            chambers.scar = clampf(max(getattr(chambers, "scar", 0.0), struct.unpack("<f", scar_data)[0]), 0.0, 1.0)
+                        extra = mf.read(12)
+                        if len(extra) == 12:
+                            coherence, phase_lock, threshold_bias = struct.unpack("<3f", extra)
+                            chambers.coherence = clampf(max(getattr(chambers, "coherence", 0.0), coherence), 0.0, 1.0)
+                            chambers.phase_lock = clampf(max(getattr(chambers, "phase_lock", 0.0), phase_lock), 0.0, 1.0)
+                            chambers.threshold_bias = clampf(threshold_bias, 0.0, 1.0)
             except Exception:
                 pass
         return True
@@ -561,6 +939,74 @@ def save_memory(mw, path, periodic=None, chambers=None):
             mf.write(struct.pack("<I", QMEM_SOMA))
             mf.write(struct.pack("<6f", *[clampf(v, 0.0, 1.0) for v in chambers.soma]))
             mf.write(struct.pack("<3f", clampf(chambers.presence, 0.0, 1.0), clampf(chambers.debt, 0.0, 1.0), clampf(chambers.trauma, 0.0, 1.0)))
+            mf.write(struct.pack("<f", clampf(getattr(chambers, "scar", 0.0), 0.0, 1.0)))
+            mf.write(struct.pack("<3f", clampf(getattr(chambers, "coherence", 0.0), 0.0, 1.0), clampf(getattr(chambers, "phase_lock", 0.0), 0.0, 1.0), clampf(getattr(chambers, "threshold_bias", 0.0), 0.0, 1.0)))
+def save_spore(mw, path, periodic=None, chambers=None):
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    with open(path, "wb") as mf:
+        mf.write(struct.pack("<II", QSPORE_MAGIC, QSPORE_VERSION))
+        if chambers is None:
+            mf.write(struct.pack("<6f", *([0.0] * 6)))
+            mf.write(struct.pack("<6f", *([0.0] * 6)))
+            mf.write(struct.pack("<4f", 0.0, 0.0, 0.0, 0.0))
+        else:
+            mf.write(struct.pack("<6f", *[clampf(v, 0.0, 1.0) for v in chambers.act]))
+            mf.write(struct.pack("<6f", *[clampf(v, 0.0, 1.0) for v in chambers.soma]))
+            mf.write(struct.pack("<4f", clampf(chambers.presence, 0.0, 1.0), clampf(chambers.debt, 0.0, 1.0), clampf(chambers.trauma, 0.0, 1.0), clampf(getattr(chambers, "scar", 0.0), 0.0, 1.0)))
+        prophecies = list(mw.prophecies[:16])
+        mf.write(struct.pack("<I", len(prophecies)))
+        for target, strength, age in prophecies:
+            mf.write(struct.pack("<ifi", target, clampf(strength, 0.0, 1.0), int(age)))
+        elems = []
+        if periodic is not None:
+            elems = sorted(periodic.elements.items(), key=lambda item: (-item[1]["mass"], item[0]))[:32]
+        mf.write(struct.pack("<I", len(elems)))
+        for word, elem in elems:
+            wbytes = word.encode("utf-8")[:31]
+            mf.write(struct.pack("B", len(wbytes)))
+            mf.write(wbytes)
+            mf.write(struct.pack("B", elem["ch"]))
+            mf.write(struct.pack("<f", clampf(elem["mass"], 0.0, 1.0)))
+def load_spore(mw, path, periodic=None, chambers=None):
+    try:
+        with open(path, "rb") as mf:
+            magic, version = struct.unpack("<II", mf.read(8))
+            if magic != QSPORE_MAGIC or version != QSPORE_VERSION:
+                return False
+            act_vals = struct.unpack("<6f", mf.read(24))
+            soma_vals = struct.unpack("<6f", mf.read(24))
+            presence, debt, trauma, scar = struct.unpack("<4f", mf.read(16))
+            if chambers is not None:
+                for i in range(N_CHAMBERS):
+                    chambers.act[i] = clampf(max(chambers.act[i], 0.55 * act_vals[i]), 0.0, 1.0)
+                    chambers.soma[i] = clampf(max(chambers.soma[i], 0.60 * soma_vals[i]), 0.0, 1.0)
+                chambers.presence = clampf(max(chambers.presence, 0.70 * presence), 0.0, 1.0)
+                chambers.debt = clampf(max(chambers.debt, 0.55 * debt), 0.0, 1.0)
+                chambers.trauma = clampf(max(chambers.trauma, 0.55 * trauma), 0.0, 1.0)
+                chambers.scar = clampf(max(getattr(chambers, "scar", 0.0), 0.60 * scar), 0.0, 1.0)
+            n_prop = struct.unpack("<I", mf.read(4))[0]
+            for _ in range(min(n_prop, 16)):
+                target, strength, age = struct.unpack("<ifi", mf.read(12))
+                prophecy_add(mw, target, 0.65 * strength)
+                if mw.prophecies:
+                    mw.prophecies[-1][2] = max(mw.prophecies[-1][2], int(age))
+            n_elem = struct.unpack("<I", mf.read(4))[0]
+            if periodic is not None:
+                for _ in range(min(n_elem, 32)):
+                    wlen = struct.unpack("B", mf.read(1))[0]
+                    word = mf.read(wlen).decode("utf-8", errors="replace")
+                    chamber = struct.unpack("B", mf.read(1))[0]
+                    mass = struct.unpack("<f", mf.read(4))[0]
+                    if chamber < 6 and word:
+                        prev = periodic.elements.get(word)
+                        val = {"ch": chamber, "mass": 0.65 * clampf(mass, 0.0, 1.0)}
+                        if prev is None or val["mass"] > prev["mass"]:
+                            periodic.elements[word] = val
+            return True
+    except Exception:
+        return False
 # ── Chambers ──
 class Chambers:
     def __init__(self):
@@ -569,6 +1015,10 @@ class Chambers:
         self.debt = 0.0
         self.trauma = 0.0
         self.presence = 0.0
+        self.scar = 0.0
+        self.coherence = 0.0
+        self.phase_lock = 0.0
+        self.threshold_bias = 0.0
 
     def feel(self, text, periodic=None):
         soma_hits = 0
@@ -605,6 +1055,29 @@ class Chambers:
         for i in range(N_CHAMBERS):
             self.act[i] = clampf(self.act[i], 0.0, 1.0)
 
+    def absorb_dark_matter(self, text, periodic=None):
+        score = 0.0
+        hits = 0
+        for word in extract_words(text):
+            if word in DARK_MATTER_WORDS:
+                score += DARK_MATTER_WORDS[word]
+                hits += 1
+            if periodic is not None:
+                el = periodic.classify(word)
+                if el is not None and el["ch"] in (CH_FEAR, CH_RAGE, CH_VOID):
+                    score += 0.08 * el["mass"]
+        if hits <= 0 and score < 0.15:
+            self.scar = clampf(self.scar * 0.995, 0.0, 1.0)
+            return 0.0
+        scar = clampf(score / max(1.0, 1.8 + 0.25 * hits), 0.0, 1.0)
+        self.scar = clampf(0.90 * self.scar + 0.10 * scar, 0.0, 1.0)
+        self.trauma = clampf(self.trauma + 0.08 * self.scar, 0.0, 1.0)
+        self.debt = clampf(self.debt + 0.05 * self.scar, 0.0, 1.0)
+        self.act[CH_VOID] = clampf(self.act[CH_VOID] + 0.10 * self.scar, 0.0, 1.0)
+        self.act[CH_FEAR] = clampf(self.act[CH_FEAR] + 0.06 * self.scar, 0.0, 1.0)
+        self.presence = clampf(self.presence * (1.0 - 0.08 * self.scar), 0.0, 1.0)
+        return self.scar
+
     def dominant(self):
         return max(range(N_CHAMBERS), key=lambda i: self.act[i])
 
@@ -633,7 +1106,30 @@ class Chambers:
                 parts.append("%s:%.0f%%" % (CH_N[i], self.act[i] * 100.0))
         if self.presence > 0.05:
             parts.append("SOMA:%.0f%%" % (self.presence * 100.0))
+        if self.scar > 0.05:
+            parts.append("SCAR:%.0f%%" % (self.scar * 100.0))
+        if self.phase_lock > 0.05:
+            parts.append("PHASE:%.0f%%" % (self.phase_lock * 100.0))
         return " ".join(parts) if parts else "quiet"
+def coherence_env_pressure(ch, dissonance, prophecy_debt=0.0, chunk_res=0.0):
+    return clampf(0.34 * dissonance + 0.26 * prophecy_debt + 0.18 * chunk_res + 0.10 * ch.act[CH_CMPLX] + 0.08 * ch.scar, 0.0, 1.0)
+def soft_phase_gate(ch, env_pressure=0.0):
+    threshold = clampf(0.42 + 0.18 * ch.threshold_bias + 0.06 * ch.scar, 0.25, 0.88)
+    signal = clampf(0.50 * ch.coherence + 0.34 * ch.phase_lock + 0.12 * env_pressure + 0.06 * ch.presence - 0.08 * ch.trauma, 0.0, 1.0)
+    gate = clampf(0.5 + 1.35 * (signal - threshold), 0.0, 1.0)
+    return gate
+def update_phase_state(ch, local_coherence, env_pressure):
+    local_coherence = clampf(local_coherence, 0.0, 1.0)
+    env_pressure = clampf(env_pressure, 0.0, 1.0)
+    ch.coherence = clampf(0.84 * ch.coherence + 0.16 * local_coherence, 0.0, 1.0)
+    target = clampf(0.52 * ch.coherence + 0.18 * ch.presence + 0.16 * ch.emergence() + 0.14 * env_pressure - 0.08 * ch.scar, 0.0, 1.0)
+    threshold = clampf(0.42 + 0.18 * ch.threshold_bias + 0.06 * ch.scar, 0.25, 0.88)
+    if target >= threshold:
+        ch.phase_lock = clampf(0.88 * ch.phase_lock + 0.12 * target + 0.05 * (target - threshold), 0.0, 1.0)
+    else:
+        ch.phase_lock = clampf(0.975 * ch.phase_lock + 0.025 * target, 0.0, 1.0)
+    ch.threshold_bias = clampf(0.93 * ch.threshold_bias + 0.07 * env_pressure, 0.0, 1.0)
+    return soft_phase_gate(ch, env_pressure)
 def ch_init(c):
     c.act = [0.0] * 6
     c.soma = [0.0] * 6
@@ -642,6 +1138,10 @@ def ch_init(c):
     c.debt = 0.0
     c.trauma = 0.0
     c.presence = 0.0
+    c.scar = 0.0
+    c.coherence = 0.0
+    c.phase_lock = 0.0
+    c.threshold_bias = 0.0
 def ch_xfire(c, it):
     for _ in range(it):
         old = list(c.act)
@@ -653,9 +1153,98 @@ def ch_xfire(c, it):
             c.act[i] = clampf(c.act[i], 0.0, 1.0)
             c.soma[i] = clampf(0.94 * c.soma[i] + 0.02 * c.act[i], 0.0, 1.0)
         c.presence = clampf(0.95 * c.presence + 0.03 * c.emergence(), 0.0, 1.0)
+        c.scar = clampf(c.scar * 0.985, 0.0, 1.0)
+def janus_phase_pressure(c, step_idx, total_steps):
+    if total_steps <= 0:
+        return
+    d = float(step_idx) / float(total_steps)
+    if d < 0.33:
+        c.act[CH_FLOW] = clampf(c.act[CH_FLOW] + 0.05, 0.0, 1.0)
+    elif d < 0.66:
+        c.act[CH_FEAR] = clampf(c.act[CH_FEAR] + 0.04, 0.0, 1.0)
+    else:
+        c.act[CH_VOID] = clampf(c.act[CH_VOID] + 0.05, 0.0, 1.0)
+    if d > 0.75:
+        c.act[CH_CMPLX] = clampf(c.act[CH_CMPLX] + 0.03, 0.0, 1.0)
+def velocity_profile(ch, dissonance):
+    mode = VEL_WALK
+    if dissonance > 0.8:
+        mode = VEL_UP
+    elif dissonance > 0.6:
+        mode = VEL_RUN
+    elif dissonance < 0.2:
+        mode = VEL_STOP
+    elif ch.trauma > 0.5:
+        mode = VEL_BREATHE
+    elif ch.debt > 0.55:
+        mode = VEL_DOWN
+
+    prof = {
+        "mode": mode,
+        "name": VEL_N[mode],
+        "temp_mul": 1.0,
+        "heb_mul": 1.0,
+        "pro_mul": 1.0,
+        "ds_mul": 1.0,
+        "bg_mul": 1.0,
+        "tg_mul": 1.0,
+        "interf_bonus": 0.0,
+        "wormhole_bonus": 0.0,
+        "debt_decay": 1.0,
+        "trauma_decay": 1.0,
+        "scar_decay": 1.0,
+        "dark_pressure": 0.0,
+    }
+    if mode == VEL_RUN:
+        prof["temp_mul"] = 1.12
+        prof["bg_mul"] = 1.15
+        prof["interf_bonus"] = 0.05
+    elif mode == VEL_STOP:
+        prof["temp_mul"] = 0.72
+        prof["ds_mul"] = 1.25
+        prof["debt_decay"] = 0.75
+    elif mode == VEL_BREATHE:
+        prof["temp_mul"] = 0.9
+        prof["debt_decay"] = 0.65
+        prof["trauma_decay"] = 0.75
+        prof["scar_decay"] = 0.82
+    elif mode == VEL_UP:
+        prof["temp_mul"] = 1.22
+        prof["pro_mul"] = 1.25
+        prof["bg_mul"] = 0.9
+        prof["wormhole_bonus"] = 0.05
+        prof["interf_bonus"] = 0.1
+    elif mode == VEL_DOWN:
+        prof["temp_mul"] = 0.82
+        prof["heb_mul"] = 1.1
+        prof["bg_mul"] = 1.1
+        prof["pro_mul"] = 0.9
+    prof["wormhole_bonus"] -= 0.05 * getattr(ch, "scar", 0.0)
+    prof["interf_bonus"] -= 0.08 * getattr(ch, "scar", 0.0)
+    prof["dark_pressure"] = 0.18 * getattr(ch, "scar", 0.0)
+    return prof
 class Interference:
     def __init__(self):
         self.docs = []
+
+    def _summarize_ids(self, ids, bpe, heavy_limit=32, keyword_limit=16):
+        tmp = MetaW()
+        meta_build(tmp, ids, len(ids), bpe.vocab_size)
+        heavy = []
+        counts = {}
+        for a, b, _p in tmp.bigrams:
+            counts[a] = counts.get(a, 0) + 1
+            counts[b] = counts.get(b, 0) + 1
+        ranked = sorted(counts.items(), key=lambda x: (-x[1], x[0]))
+        keywords = []
+        for tok, _score in ranked:
+            dec = bpe_decode_token(bpe, tok).strip()
+            if len(dec) > 2 and any(ch.isalpha() for ch in dec):
+                heavy.append(tok)
+                keywords.append(dec.lower())
+            if len(heavy) >= heavy_limit:
+                break
+        return {"heavy": heavy or ids[:heavy_limit], "keywords": keywords[:keyword_limit]}
 
     def load_docs(self, docs_dir, bpe):
         self.docs = []
@@ -671,33 +1260,99 @@ class Interference:
             except OSError:
                 continue
             ids = bpe_encode(bpe, raw, len(raw), len(raw))
-            tmp = MetaW()
-            meta_build(tmp, ids, len(ids), bpe.vocab_size)
-            heavy = []
-            counts = {}
-            for a, b, _p in tmp.bigrams:
-                counts[a] = counts.get(a, 0) + 1
-                counts[b] = counts.get(b, 0) + 1
-            ranked = sorted(counts.items(), key=lambda x: (-x[1], x[0]))
-            for tok, _score in ranked:
-                dec = bpe_decode_token(bpe, tok).strip()
-                if len(dec) > 2 and any(ch.isalpha() for ch in dec):
-                    heavy.append(tok)
-                if len(heavy) >= 32:
+            doc = {"name": fn, **self._summarize_ids(ids, bpe, 32, 16), "chunks": []}
+            chunk_len = 64
+            stride = 32
+            for start in range(0, len(ids), stride):
+                part = ids[start:start + chunk_len]
+                if len(part) < 12:
+                    continue
+                chunk = self._summarize_ids(part, bpe, 16, 8)
+                if chunk["heavy"]:
+                    chunk["start"] = start
+                    doc["chunks"].append(chunk)
+                if len(doc["chunks"]) >= 8:
                     break
-            self.docs.append({"name": fn, "heavy": heavy or ids[:32]})
+            if not doc["chunks"] and doc["heavy"]:
+                doc["chunks"].append({"start": 0, "heavy": doc["heavy"][:16], "keywords": doc["keywords"][:8]})
+            self.docs.append(doc)
 
-    def inject_seed(self, chambers=None, bpe=None, periodic=None):
+    def _score_item(self, item, words, dom, periodic, prophecy_words):
+        score = 0.01 * len(item.get("heavy", []))
+        for word in item.get("keywords", []):
+            if word in words:
+                score += 1.2
+            if word in ANCHORS and ANCHORS[word] == dom:
+                score += 0.6
+            if periodic is not None:
+                el = periodic.classify(word)
+                if el is not None and el["ch"] == dom:
+                    score += 0.35 * el["mass"]
+            if word in prophecy_words:
+                score += 0.9 * prophecy_words[word]
+        score += random.random() * 0.05
+        return score
+
+    def _prophecy_words(self, mw, bpe):
+        out = {}
+        if mw is None:
+            return out
+        for target, strength, _age in mw.prophecies:
+            word = bpe_decode_token(bpe, target).strip().lower()
+            if len(word) > 2 and any(ch.isalpha() for ch in word):
+                age_boost = strength * math.log1p(float(_age))
+                out[word] = max(out.get(word, 0.0), age_boost)
+        return out
+
+    def choose_doc(self, text=None, chambers=None, periodic=None, mw=None, bpe=None):
         if not self.docs:
             return None
-        doc = random.choice(self.docs)
+        if chambers is None and not text:
+            return random.choice(self.docs)
+        words = set(extract_words(text or ""))
+        dom = chambers.dominant() if chambers is not None else CH_FLOW
+        prophecy_words = self._prophecy_words(mw, bpe) if bpe is not None else {}
+        best_doc = None
+        best_score = -1e30
+        for doc in self.docs:
+            score = self._score_item(doc, words, dom, periodic, prophecy_words)
+            if score > best_score:
+                best_score = score
+                best_doc = doc
+        return best_doc
+
+    def choose_chunk(self, doc, text=None, chambers=None, periodic=None, mw=None, bpe=None):
+        if doc is None:
+            return None
+        chunks = doc.get("chunks") or []
+        if not chunks:
+            return doc
+        words = set(extract_words(text or ""))
+        dom = chambers.dominant() if chambers is not None else CH_FLOW
+        prophecy_words = self._prophecy_words(mw, bpe) if bpe is not None else {}
+        best_chunk = chunks[0]
+        best_score = -1e30
+        for chunk in chunks:
+            score = self._score_item(chunk, words, dom, periodic, prophecy_words)
+            if score > best_score:
+                best_score = score
+                best_chunk = chunk
+        return best_chunk
+
+    def inject_seed(self, chambers=None, bpe=None, periodic=None, doc=None):
+        if not self.docs and doc is None:
+            return None
+        doc = doc or random.choice(self.docs)
         if not doc["heavy"]:
             return None
+        candidates = [tid for tid in doc["heavy"] if bpe is not None and is_clean_seed_token(bpe, tid)]
+        if not candidates:
+            candidates = doc["heavy"]
         if chambers is None or bpe is None:
-            return random.choice(doc["heavy"])
+            return random.choice(candidates)
         dom = chambers.dominant()
         scored = []
-        for tid in doc["heavy"]:
+        for tid in candidates:
             token = bpe_decode_token(bpe, tid).strip().lower()
             score = 0.1
             if token in ANCHORS and ANCHORS[token] == dom:
@@ -718,26 +1373,48 @@ class Interference:
             if cum >= r:
                 return tid
         return top[0][1]
+def interference_signal(doc, V):
+    out = [0.0] * V
+    if doc is None:
+        return out
+    for rank, tid in enumerate(doc.get("heavy", [])[:16]):
+        if 0 <= tid < V:
+            out[tid] += 1.0 / (1.0 + rank)
+    mx = max(out) if out else 0.0
+    if mx > 1e-8:
+        for i in range(V):
+            out[i] /= mx
+    return out
 # ── DOE Parliament ──
 class Expert:
     def __init__(self):
         self.A = []
         self.B = []
+        self.trace = []
         self.d_in = 0
         self.d_out = 0
         self.rank = 0
         self.vitality = 1.0
         self.age = 0
         self.low_steps = 0
+        self.overload = 0.0
+        self.resonance = 0.0
+        self.plasticity_mass = 0.0
+        self.consolidations = 0
 def expert_init(e, d_in, d_out, rank):
     e.d_in = d_in
     e.d_out = d_out
     e.rank = rank
     e.A = [0.01 * (random.random() - 0.5) for _ in range(rank * d_in)]
     e.B = [0.01 * (random.random() - 0.5) for _ in range(d_out * rank)]
+    e.trace = [0.0] * (rank * d_in)
     e.vitality = 1.0
     e.age = 0
     e.low_steps = 0
+    e.overload = 0.0
+    e.resonance = 0.0
+    e.plasticity_mass = 0.0
+    e.consolidations = 0
 def expert_forward(e, x):
     mid = [0.0] * e.rank
     for r in range(e.rank):
@@ -762,9 +1439,28 @@ def expert_hebbian(e, x, dy, lr):
         u += 0.01 * (random.random() - 0.5)
         base_a = r * e.d_in
         for d in range(e.d_in):
-            e.A[base_a + d] += lr * x[d] * u
+            delta = lr * x[d] * u
+            e.A[base_a + d] += delta
+            e.trace[base_a + d] = 0.96 * e.trace[base_a + d] + 0.04 * delta
+            e.plasticity_mass += abs(delta)
         for o in range(e.d_out):
             e.B[o * e.rank + r] *= 0.999
+def expert_consolidate(e):
+    if e.plasticity_mass < 0.002:
+        return False
+    norm = sum(abs(v) for v in e.trace) / max(1, len(e.trace))
+    if norm < 1e-8:
+        return False
+    gain = min(0.12, 0.02 + 0.35 * e.plasticity_mass)
+    for i in range(len(e.trace)):
+        e.A[i] += gain * e.trace[i] / norm
+        e.trace[i] *= 0.45
+    e.vitality = clampf(e.vitality + 0.04, 0.0, 1.0)
+    e.overload *= 0.88
+    e.resonance = clampf(e.resonance + 0.03, -1.0, 1.0)
+    e.plasticity_mass *= 0.35
+    e.consolidations += 1
+    return True
 class Parliament:
     def __init__(self):
         self.ex = []
@@ -772,10 +1468,24 @@ class Parliament:
         self.d_model = 0
         self.alpha = DOE_ALPHA
         self.step = 0
+        self.last_k = 0
+        self.last_entropy = 0.0
+        self.last_diversity = 0.0
+        self.last_winners = []
+        self.last_births = 0
+        self.last_deaths = 0
+        self.last_consolidations = 0
 def parl_init(p, d_model, n_init):
     p.d_model = d_model
     p.alpha = DOE_ALPHA
     p.step = 0
+    p.last_k = 0
+    p.last_entropy = 0.0
+    p.last_diversity = 0.0
+    p.last_winners = []
+    p.last_births = 0
+    p.last_deaths = 0
+    p.last_consolidations = 0
     p.n = min(n_init, MAX_EXPERTS)
     p.ex = []
     for _ in range(p.n):
@@ -793,33 +1503,77 @@ def parl_election(p, x):
         outs.append(o)
         dot = sum(o[d] * x[d] for d in range(p.d_model))
         votes[i] = dot
-    mx = max(votes)
-    mn = min(votes)
-    cons = (mx - mn) / (abs(mx) + abs(mn) + 1e-8)
-    k = int(p.n * (1.0 - cons))
-    if k < 1:
-        k = 1
-    if k > p.n:
-        k = p.n
     sel = list(range(p.n))
     for i in range(p.n - 1):
         for j in range(i + 1, p.n):
             if votes[sel[j]] > votes[sel[i]]:
                 sel[i], sel[j] = sel[j], sel[i]
     sv = votes[sel[0]]
+    dist = [math.exp(v - sv) for v in votes]
+    dist_tot = sum(dist) if dist else 0.0
+    probs = [v / dist_tot for v in dist] if dist_tot > 0.0 else [1.0 / p.n] * p.n
+    entropy = 0.0
+    for pr in probs:
+        if pr > 1e-12:
+            entropy -= pr * math.log(pr)
+    entropy /= math.log(max(2, p.n))
+    k = 1 + int((p.n - 1) * clampf(entropy, 0.0, 1.0))
+    k = max(1, min(p.n, k))
+    p.last_k = k
+    p.last_entropy = entropy
+    winners = []
+    picked = set()
+    diversity_sum = 0.0
+    for slot in range(k):
+        best_idx = -1
+        best_score = -1e30
+        best_novelty = 0.0
+        for idx in sel:
+            if idx in picked:
+                continue
+            novelty = 1.0
+            if winners:
+                sims = []
+                base = outs[idx]
+                base_norm = math.sqrt(sum(v * v for v in base)) + 1e-8
+                for prev in winners:
+                    other = outs[prev]
+                    other_norm = math.sqrt(sum(v * v for v in other)) + 1e-8
+                    dot = sum(base[d] * other[d] for d in range(p.d_model))
+                    sims.append(max(0.0, dot / (base_norm * other_norm)))
+                novelty = clampf(1.0 - sum(sims) / len(sims), 0.0, 1.0)
+            score = votes[idx] + 0.08 * novelty - 0.06 * p.ex[idx].overload - 0.03 * clampf(p.ex[idx].resonance, 0.0, 1.0)
+            if score > best_score:
+                best_score = score
+                best_idx = idx
+                best_novelty = novelty
+        if best_idx < 0:
+            break
+        winners.append(best_idx)
+        picked.add(best_idx)
+        diversity_sum += best_novelty
+    p.last_winners = winners[:]
+    p.last_diversity = diversity_sum / len(winners) if winners else 0.0
     exps = [0.0] * p.n
     tot = 0.0
-    for i in range(k):
-        exps[i] = math.exp(votes[sel[i]] - sv)
+    for i, idx in enumerate(winners):
+        exps[i] = math.exp(votes[idx] - sv)
         tot += exps[i]
-    for i in range(k):
+    for i, idx in enumerate(winners):
         w = exps[i] / tot
         for d in range(p.d_model):
-            result[d] += w * outs[sel[i]][d]
-        p.ex[sel[i]].vitality = 0.9 * p.ex[sel[i]].vitality + 0.1 * abs(w)
-    for i in range(k, p.n):
-        p.ex[sel[i]].vitality *= 0.95
-        p.ex[sel[i]].low_steps += 1
+            result[d] += w * outs[idx][d]
+        p.ex[idx].vitality = 0.86 * p.ex[idx].vitality + 0.14 * abs(w)
+        p.ex[idx].resonance = 0.88 * p.ex[idx].resonance + 0.12 * votes[idx]
+        p.ex[idx].overload = clampf(0.90 * p.ex[idx].overload + 0.20 * max(0.0, w - 0.30), 0.0, 1.0)
+        p.ex[idx].low_steps = 0
+    for idx in range(p.n):
+        if idx in picked:
+            continue
+        recovery = 0.015 + 0.03 * (1.0 - p.ex[idx].overload)
+        p.ex[idx].vitality = clampf(0.96 * p.ex[idx].vitality + recovery * clampf(abs(p.ex[idx].resonance), 0.0, 1.0), 0.0, 1.0)
+        p.ex[idx].overload *= 0.92
+        p.ex[idx].low_steps += 1
     return result
 def parl_inject(p, logits, x, V):
     delta = parl_election(p, x)
@@ -831,24 +1585,29 @@ def parl_notorch(p, x, debt, dlen):
     ds = [0.0] * p.d_model
     for i in range(n):
         ds[i] = debt[i]
+    p.last_consolidations = 0
     for i in range(p.n):
         expert_hebbian(p.ex[i], x, ds, 0.001)
+        if p.ex[i].plasticity_mass > 0.002 and expert_consolidate(p.ex[i]):
+            p.last_consolidations += 1
         p.ex[i].age += 1
 def parl_lifecycle(p):
     # apoptosis
+    before = p.n
     alive = []
     for i in range(p.n):
-        if p.ex[i].low_steps >= 8 and p.ex[i].vitality < 0.1 and p.n > 2:
+        if p.ex[i].low_steps >= 12 and p.ex[i].vitality < 0.06 and abs(p.ex[i].resonance) < 0.05 and p.ex[i].age > 28 and p.n > 2:
             continue
         alive.append(p.ex[i])
     p.ex = alive
     p.n = len(alive)
+    p.last_deaths = max(0, before - p.n)
     # mitosis
     births = []
     for i in range(p.n):
         if p.n + len(births) >= MAX_EXPERTS:
             break
-        if p.ex[i].vitality > 0.8 and p.ex[i].age > 50:
+        if p.ex[i].vitality > 0.70 and p.ex[i].age > 40 and p.ex[i].overload > 0.32:
             child = Expert()
             expert_init(child, p.ex[i].d_in, p.ex[i].d_out, p.ex[i].rank)
             for j in range(child.rank * child.d_in):
@@ -856,10 +1615,14 @@ def parl_lifecycle(p):
             for j in range(child.d_out * child.rank):
                 child.B[j] = p.ex[i].B[j] + 0.005 * (random.random() - 0.5)
             child.vitality = 0.5
+            child.overload = 0.18
+            child.resonance = 0.5 * p.ex[i].resonance
             births.append(child)
-            p.ex[i].vitality *= 0.6
+            p.ex[i].vitality *= 0.62
+            p.ex[i].overload *= 0.5
     p.ex.extend(births)
     p.n = len(p.ex)
+    p.last_births = len(births)
     p.step += 1
 # ── Transformer ──
 class TFLayer:
@@ -1123,6 +1886,60 @@ def coherence_score(mw, ids, n, V):
         len_bonus = -0.5
     tri_norm = tri_sum / (n - 2) if n > 2 else 0
     return bi_sum / (n - 1) + 0.5 * hb_sum / (n - 1) + 0.8 * tri_norm + len_bonus
+def surface_coherence_score(bpe, ids):
+    if not ids:
+        return -1.0
+    score = surface_transition_adjust(bpe, -1, ids[0], 0)
+    if is_clean_seed_token(bpe, ids[0]):
+        score += 0.18
+    limit = min(len(ids), 12)
+    for i in range(1, limit):
+        score += surface_transition_adjust(bpe, ids[i - 1], ids[i], 1)
+    return score
+def metaweights_field_scale(step):
+    return clampf(0.55 + 0.045 * float(step), 0.55, 1.0)
+def prompt_focus_scale(has_tf, plen, step):
+    if has_tf or plen <= 1:
+        return 1.0
+    if step <= 4:
+        return 0.62
+    if step <= 8:
+        return 0.82
+    return 1.0
+def anchored_prompt_from_input(bpe, text, max_tokens=4):
+    raw = text.encode("utf-8", errors="replace")
+    inp_ids = bpe_encode(bpe, raw, len(raw), 128)
+    if not inp_ids:
+        return None
+    start = 0
+    if not is_clean_seed_token(bpe, inp_ids[start]):
+        found = False
+        for i in range(1, len(inp_ids)):
+            if starts_with_space(bpe, inp_ids[i]) and is_clean_seed_token(bpe, inp_ids[i]):
+                start = i
+                found = True
+                break
+        if not found:
+            for i in range(1, len(inp_ids)):
+                if starts_with_space(bpe, inp_ids[i]):
+                    start = i
+                    break
+    end = min(len(inp_ids), start + max_tokens)
+    return inp_ids[start:end] if end > start else None
+def early_sentence_quality(bpe, ids):
+    if not ids:
+        return -1.0
+    score = surface_coherence_score(bpe, ids)
+    if len(ids) < 8:
+        score -= 0.4
+    if not is_clean_seed_token(bpe, ids[0]):
+        score -= 0.6
+    text = "".join(bpe_decode_token(bpe, tid) for tid in ids[:10]).lstrip()
+    if len(text) >= 2 and text[0].islower():
+        score -= 0.4
+    if text.count("...") > 0:
+        score -= 0.2
+    return score
 # ── boundary check ──
 def is_boundary(bpe, tid):
     if tid < 0 or tid >= bpe.vocab_size:
@@ -1145,11 +1962,57 @@ def starts_with_space(bpe, tid):
     if len(b) == 0:
         return False
     return b[0] == ord(' ')
+def opens_segment(bpe, tid):
+    if tid < 0 or tid >= bpe.vocab_size:
+        return True
+    b = bpe.vocab_bytes.get(tid, b"")
+    for i in range(len(b) - 1, -1, -1):
+        c = b[i]
+        if c in (ord(' '), ord('\n'), ord('\r'), ord('\t')):
+            continue
+        return c in (ord('('), ord('['), ord('{'), ord('"'), ord('\''), ord(':'), ord(';'))
+    return True
+def is_lower_fragment_start(bpe, tid):
+    if tid < 0 or tid >= bpe.vocab_size:
+        return False
+    b = bpe.vocab_bytes.get(tid, b"")
+    return len(b) > 0 and b[0] != ord(' ') and ord('a') <= b[0] <= ord('z')
+def is_clean_seed_token(bpe, tid):
+    if tid < 0 or tid >= bpe.vocab_size:
+        return False
+    if starts_with_space(bpe, tid):
+        return True
+    b = bpe.vocab_bytes.get(tid, b"")
+    return len(b) > 0 and not (ord('a') <= b[0] <= ord('z'))
+def surface_transition_adjust(bpe, prev_tid, cur_tid, step):
+    if cur_tid < 0 or cur_tid >= bpe.vocab_size:
+        return 0.0
+    if step == 0:
+        return -1.15 if is_lower_fragment_start(bpe, cur_tid) else 0.0
+    if prev_tid >= 0 and (is_boundary(bpe, prev_tid) or opens_segment(bpe, prev_tid)):
+        if is_lower_fragment_start(bpe, cur_tid):
+            return -1.05
+        if starts_with_space(bpe, cur_tid):
+            return 0.06
+    return 0.0
+def display_start_index(bpe, ids):
+    for i, tid in enumerate(ids):
+        s = bpe_decode_token(bpe, tid)
+        if not s:
+            continue
+        c = s[0]
+        if i == 0 and (c.isalnum() or c in "\"'([{"):
+            return i
+        if c.isspace():
+            return i
+    return 0
 # ── generate sentence ──
-def gen_sent(t, bpe, mw, prompt, plen, temp, maxo, parl, global_destiny, ch_ptr):
+def gen_sent(t, bpe, mw, prompt, plen, temp, maxo, parl, global_destiny, ch_ptr, velocity=None, doc_signal=None):
     tf_reset(t)
     V = t.V; D = t.D
     destiny = [0.0] * D
+    prompt_anchor = [0.0] * D
+    prompt_anchor_norm = 0.0
     if global_destiny is not None:
         for d in range(D):
             destiny[d] = 0.3 * global_destiny[d]
@@ -1163,6 +2026,14 @@ def gen_sent(t, bpe, mw, prompt, plen, temp, maxo, parl, global_destiny, ch_ptr)
         tf_forward(t, prompt[i], i)
         ctx[cl] = prompt[i]; cl += 1
         out.append(prompt[i]); gl += 1
+        if 0 <= prompt[i] < t.V:
+            for d in range(D):
+                prompt_anchor[d] += t.tok[prompt[i] * D + d]
+    if plen > 0:
+        inv = 1.0 / float(plen)
+        for d in range(D):
+            prompt_anchor[d] *= inv
+        prompt_anchor_norm = math.sqrt(sum(v * v for v in prompt_anchor) + 1e-10)
 
     am, bm, gm, tm = (1.0, 1.0, 1.0, 1.0)
     if ch_ptr is not None:
@@ -1217,11 +2088,21 @@ def gen_sent(t, bpe, mw, prompt, plen, temp, maxo, parl, global_destiny, ch_ptr)
         hs = max(0, cl - 8)
         heb = meta_hebb(mw, ctx[hs:cl], cl - hs, V)
         pro = meta_prophecy(mw, ctx[:cl], cl, V)
+        p_debt = prophecy_pressure(mw)
 
         # trauma gravity
         if ch_ptr is not None and ch_ptr.trauma > 0.1:
             for i in range(V):
                 raw[i] /= (1.0 + ch_ptr.trauma)
+        if ch_ptr is not None and getattr(ch_ptr, "scar", 0.0) > 0.05:
+            scar = ch_ptr.scar
+            for i in range(V):
+                raw[i] *= (1.0 - 0.08 * scar)
+            for anchor, chamber in ANCHORS.items():
+                if chamber == CH_VOID:
+                    tok = bpe_find_token(bpe, anchor)
+                    if 0 <= tok < V:
+                        raw[tok] += 0.12 * scar
 
         # detect if transformer is active
         tmag = sum(abs(raw[v]) for v in range(V)) / (V if V > 0 else 1)
@@ -1233,6 +2114,28 @@ def gen_sent(t, bpe, mw, prompt, plen, temp, maxo, parl, global_destiny, ch_ptr)
         c_ds  = (0.3 if has_tf else 0.15) * gm
         c_bg  = 5.0 if has_tf else 15.0
         c_tg  = 3.0 if has_tf else 10.0
+        if velocity is not None:
+            c_heb *= velocity["heb_mul"]
+            c_pro *= velocity["pro_mul"] * (1.0 + 0.35 * p_debt)
+            c_ds *= velocity["ds_mul"]
+            c_bg *= velocity["bg_mul"]
+            c_tg *= velocity["tg_mul"]
+            c_ds *= (1.0 - 0.20 * velocity["dark_pressure"])
+        c_doc = 0.18 if has_tf else 0.32
+        if not has_tf:
+            mw_scale = metaweights_field_scale(step)
+            c_pro *= mw_scale
+            c_bg *= mw_scale
+            c_tg *= mw_scale
+            c_doc *= mw_scale
+        focus = prompt_focus_scale(has_tf, plen, step)
+        c_pro *= focus
+        c_bg *= focus
+        c_tg *= focus
+        c_doc *= focus
+        c_prompt = 0.0
+        if has_tf and prompt_anchor_norm > 1e-8 and step < 6:
+            c_prompt = (0.14 if step < 2 else 0.09) * focus
 
         for i in range(V):
             bg = meta_bi(mw, ctx[cl - 1], i)
@@ -1244,6 +2147,13 @@ def gen_sent(t, bpe, mw, prompt, plen, temp, maxo, parl, global_destiny, ch_ptr)
                     dot = sum(destiny[d] * t.tok[i * D + d] for d in range(D))
                     ds = dot / (dn * en)
             raw[i] += c_heb * heb[i] + c_pro * pro[i] + c_ds * ds + c_bg * bg + c_tg * tg_val
+            if doc_signal is not None:
+                raw[i] += c_doc * doc_signal[i]
+            if c_prompt > 0.0:
+                en = math.sqrt(sum(t.tok[i * D + d] * t.tok[i * D + d] for d in range(D)) + 1e-10)
+                if en > 1e-8:
+                    dot = sum(prompt_anchor[d] * t.tok[i * D + d] for d in range(D))
+                    raw[i] += c_prompt * (dot / (prompt_anchor_norm * en))
             if mw.unigram[i] < 1e-6:
                 raw[i] -= 2.0
             elif mw.unigram[i] > 0.01:
@@ -1262,9 +2172,13 @@ def gen_sent(t, bpe, mw, prompt, plen, temp, maxo, parl, global_destiny, ch_ptr)
                 if ctx[ri] == ctx[cl - 2] and ctx[ri + 1] < V:
                     raw[ctx[ri + 1]] *= 0.2
 
+        prev_tok = ctx[cl - 1] if cl > 0 else -1
+        for i in range(V):
+            raw[i] += surface_transition_adjust(bpe, prev_tok, i, step)
+
         # hybrid decode
         if not has_tf:
-            if step < 6:
+            if step < 10:
                 ch_tok = 0
                 mx_val = raw[0]
                 for i in range(1, V):
@@ -1272,20 +2186,25 @@ def gen_sent(t, bpe, mw, prompt, plen, temp, maxo, parl, global_destiny, ch_ptr)
                         mx_val = raw[i]
                         ch_tok = i
             else:
-                ch_tok = sample_nucleus(raw, V, 0.5, 0.7)
-        elif step < 4:
+                ch_tok = sample_nucleus(raw, V, 0.35, 0.55)
+        elif step < 2:
             ch_tok = 0
             mx_val = raw[0]
             for i in range(1, V):
                 if raw[i] > mx_val:
                     mx_val = raw[i]
                     ch_tok = i
+        elif step < 5:
+            vel_temp = velocity["temp_mul"] if velocity is not None else 1.0
+            ch_tok = sample_nucleus(raw, V, clampf(temp * tm * vel_temp * 0.72, 0.22, 0.55), 0.60)
         else:
-            ch_tok = sample_nucleus(raw, V, clampf(temp * tm, 0.3, 1.2), 0.85)
+            vel_temp = velocity["temp_mul"] if velocity is not None else 1.0
+            ch_tok = sample_nucleus(raw, V, clampf(temp * tm * vel_temp, 0.25, 1.35), 0.85)
 
         prev_chosen = ch_tok
         out.append(ch_tok); gl += 1
         ctx[cl] = ch_tok; cl += 1
+        prophecy_update(mw, ch_tok)
 
         # word capture
         if cl >= 2:
@@ -1300,6 +2219,19 @@ def gen_sent(t, bpe, mw, prompt, plen, temp, maxo, parl, global_destiny, ch_ptr)
             if not found and mw.n_bi < MAX_BIGRAM:
                 mw.bigrams.append([prev_tok, cur, 0.01])
                 mw.n_bi += 1
+            best_pred = -1
+            best_prob = 0.0
+            for i in range(mw.n_tri):
+                if mw.trigrams[i][0] == prev_tok and mw.trigrams[i][1] == cur and mw.trigrams[i][3] > best_prob:
+                    best_prob = mw.trigrams[i][3]
+                    best_pred = mw.trigrams[i][2]
+            if best_pred < 0:
+                for i in range(mw.n_bi):
+                    if mw.bigrams[i][0] == cur and mw.bigrams[i][2] > best_prob:
+                        best_prob = mw.bigrams[i][2]
+                        best_pred = mw.bigrams[i][1]
+            if best_pred >= 0:
+                prophecy_add(mw, best_pred, 0.2 + 0.5 * best_prob)
 
             hw = max(0, cl - 6)
             for ri in range(hw, cl - 1):
@@ -1373,6 +2305,7 @@ def spa_cross_attend(s, embs, S):
     return scores
 # ── chain ──
 def gen_chain(t, bpe, mw, ch, cids, clen, has_weights, parl, periodic=None, interference=None, input_text=None):
+    events = new_experience_log()
     # calendar dissonance
     try:
         epoch_t = time.mktime((2024, 10, 3, 12, 0, 0, 0, 0, -1))
@@ -1402,15 +2335,23 @@ def gen_chain(t, bpe, mw, ch, cids, clen, has_weights, parl, periodic=None, inte
         inp_bytes = input_text.encode("utf-8", errors="replace")
         ingest_ids(mw, bpe_encode(bpe, inp_bytes, len(inp_bytes), 512))
         ch.feel(input_text, periodic)
+        scar = ch.absorb_dark_matter(input_text, periodic)
+        if scar > 0.0:
+            events["scars"].append({"step": -1, "scar": scar, "note": "prompt"})
         ch.act[CH_FLOW] = clampf(ch.act[CH_FLOW] + 0.1, 0.0, 1.0)
         ch_xfire(ch, 8)
+    vel = velocity_profile(ch, cd)
+    ch.debt = clampf((0.88 * ch.debt + 0.12 * prophecy_pressure(mw)) * vel["debt_decay"], 0.0, 1.0)
+    ch.trauma = clampf(ch.trauma * vel["trauma_decay"], 0.0, 1.0)
+    ch.scar = clampf(ch.scar * vel["scar_decay"], 0.0, 1.0)
+    phase_gate = soft_phase_gate(ch, coherence_env_pressure(ch, cd, prophecy_pressure(mw), 0.0))
 
     mode_str = "[TRAINED]" if has_weights else "[METAWEIGHTS ONLY]"
-    print("\n  diss=%.3f debt=%.3f emrg=%.3f %s" % (cd, ch.debt, ch.emergence(), mode_str))
+    print("\n  diss=%.3f debt=%.3f scar=%.3f gate=%.3f emrg=%.3f vel=%s %s" % (cd, ch.debt, ch.scar, phase_gate, ch.emergence(), vel["name"], mode_str))
     print("  chambers: %s" % ch.summary())
     if parl is not None:
         av = sum(e.vitality for e in parl.ex) / (parl.n if parl.n > 0 else 1)
-        print("  parliament: %d experts, avg_vitality=%.2f" % (parl.n, av))
+        print("  parliament: %d experts, avg_vitality=%.2f div=%.2f winners=%d cons=%d" % (parl.n, av, parl.last_diversity, len(parl.last_winners), parl.last_consolidations))
     if interference is not None and interference.docs:
         print("  interference: %d docs loaded" % len(interference.docs))
     print()
@@ -1422,6 +2363,10 @@ def gen_chain(t, bpe, mw, ch, cids, clen, has_weights, parl, periodic=None, inte
     chain_lens = [0] * CHAIN_STEPS
 
     for si in range(CHAIN_STEPS):
+        janus_phase_pressure(ch, si, CHAIN_STEPS)
+        d_phase = float(si) / float(CHAIN_STEPS)
+        phase = "flow" if d_phase < 0.33 else ("fear" if d_phase < 0.66 else "void")
+        events["phases"].append({"step": si, "phase": phase, "flow": ch.act[CH_FLOW], "fear": ch.act[CH_FEAR], "void": ch.act[CH_VOID], "complexity": ch.act[CH_CMPLX]})
         if si < nb:
             direction = -1
         elif si == nb:
@@ -1429,18 +2374,27 @@ def gen_chain(t, bpe, mw, ch, cids, clen, has_weights, parl, periodic=None, inte
         else:
             direction = 1
 
+        active_doc = interference.choose_doc(input_text, ch, periodic, mw, bpe) if interference is not None and interference.docs else None
+        active_chunk = interference.choose_chunk(active_doc, input_text, ch, periodic, mw, bpe) if active_doc is not None else None
+        if active_chunk is not None:
+            events["chunks"].append({"step": si, "doc_name": active_doc.get("name") if active_doc is not None else None, "chunk_start": int(active_chunk.get("start", 0)), "resonance": float(len(active_chunk.get("heavy", [])))})
+        if active_chunk is not None and t.D > 0 and active_chunk.get("heavy"):
+            clean_heavy = [tid for tid in active_chunk["heavy"] if is_clean_seed_token(bpe, tid)]
+            seed_tok = clean_heavy[0] if clean_heavy else active_chunk["heavy"][0]
+            if 0 <= seed_tok < t.V:
+                for d in range(t.D):
+                    gdest[d] = 0.97 * gdest[d] + 0.03 * t.tok[seed_tok * t.D + d]
+        doc_signal = interference_signal(active_chunk, t.V) if active_chunk is not None else None
+
         prompt = None
         used_interference = False
-        if interference is not None and interference.docs and random.random() < 0.3:
-            seed = interference.inject_seed(ch, bpe, periodic)
+        if input_text:
+            prompt = anchored_prompt_from_input(bpe, input_text, 4)
+        if prompt is None and interference is not None and interference.docs and random.random() < clampf(0.3 + vel["interf_bonus"], 0.05, 0.5):
+            seed = interference.inject_seed(ch, bpe, periodic, active_chunk or active_doc)
             if seed is not None:
                 prompt = [seed]
                 used_interference = True
-        if prompt is None and input_text:
-            inp_ids = bpe_encode(bpe, input_text.encode("utf-8", errors="replace"), len(input_text.encode("utf-8", errors="replace")), 128)
-            if inp_ids:
-                st = random.randint(0, max(0, len(inp_ids) - 2))
-                prompt = inp_ids[st:st + 2]
         pl = len(prompt) if prompt is not None else 0
         if prompt is None:
             start = -1
@@ -1482,7 +2436,7 @@ def gen_chain(t, bpe, mw, ch, cids, clen, has_weights, parl, periodic=None, inte
                     + 0.1 * math.sin(2 * math.pi * 20.8 * t_sec)
                     + 0.05 * math.sin(2 * math.pi * 27.3 * t_sec))
         base_temp = 0.6 if has_weights else 0.75
-        temp = clampf(base_temp + 0.08 * schumann, 0.4, 0.85)
+        temp = clampf((base_temp + 0.08 * schumann) * vel["temp_mul"], 0.35, 0.95)
 
         # best-of-3
         best_out = []
@@ -1490,16 +2444,24 @@ def gen_chain(t, bpe, mw, ch, cids, clen, has_weights, parl, periodic=None, inte
         best_sc = -1e30
         gdest_save = list(gdest) if t.D <= 256 else None
 
-        for cand in range(3):
+        cand_trials = 5 if (not has_weights and si <= 1) else 3
+        best_q = -1e30
+        for cand in range(cand_trials):
             if cand > 0 and gdest_save is not None:
                 gdest[:] = list(gdest_save)
-            result = gen_sent(t, bpe, mw, prompt, pl, temp, 256, parl, gdest, ch)
-            sc = coherence_score(mw, result, len(result), t.V)
+            cand_temp = temp
+            if not has_weights and si <= 1 and cand > 0:
+                cand_temp = clampf(temp * (0.92 - 0.06 * min(cand, 3)), 0.28, temp)
+            result = gen_sent(t, bpe, mw, prompt, pl, cand_temp, 256, parl, gdest, ch, vel, doc_signal)
+            sc = coherence_score(mw, result, len(result), t.V) + 0.6 * surface_coherence_score(bpe, result)
+            q_sc = early_sentence_quality(bpe, result) if (not has_weights and si <= 1) else sc
+            if q_sc > best_q:
+                best_q = q_sc
             if sc > best_sc:
                 best_sc = sc
                 best_ol = len(result)
                 best_out = list(result)
-            if best_sc > 1.0 and best_ol > 12:
+            if best_q > 0.1 and best_sc > 1.0 and best_ol > 12:
                 break
 
         wormhole = False
@@ -1507,15 +2469,23 @@ def gen_chain(t, bpe, mw, ch, cids, clen, has_weights, parl, periodic=None, inte
             wh_prob = 0.02
             if cd > 0.3:
                 wh_prob += ((cd - 0.3) / 0.7) * 0.15
-            wormhole = random.random() < wh_prob
+            wh_prob = clampf(wh_prob + vel["wormhole_bonus"], 0.0, 0.3)
+            boundary_ok = best_ol > 10 and best_sc > (0.22 + 0.18 * phase_gate)
+            wormhole = boundary_ok and (random.random() < wh_prob)
             if wormhole and interference is not None and interference.docs:
                 longest = max(interference.docs, key=lambda d: len(d["heavy"]))
                 if longest["heavy"]:
-                    prompt = [random.choice(longest["heavy"])]
+                    wh_seed = random.choice(longest["heavy"])
+                    prompt = best_out[max(0, best_ol - 3):best_ol] + [wh_seed]
                     direction = -direction if direction != 0 else 1
-                    best_out = gen_sent(t, bpe, mw, prompt, len(prompt), 0.55 if has_weights else 0.7, 256, parl, gdest, ch)
+                    best_out = gen_sent(t, bpe, mw, prompt, len(prompt), 0.55 if has_weights else 0.7, 256, parl, gdest, ch, vel, doc_signal)
                     best_ol = len(best_out)
-                    best_sc = coherence_score(mw, best_out, best_ol, t.V)
+                    best_sc = coherence_score(mw, best_out, best_ol, t.V) + 0.6 * surface_coherence_score(bpe, best_out)
+                    if best_sc < 0.15:
+                        ch.debt = clampf(ch.debt + 0.04, 0.0, 1.0)
+                    else:
+                        ch.debt = clampf(ch.debt * 0.97, 0.0, 1.0)
+                    events["wormholes"].append({"step": si, "success": best_sc >= 0.15, "coherence": best_sc, "debt": ch.debt})
 
         mk = '<' if direction < 0 else ('*' if direction == 0 else '>')
         marker = mk + ('+' if wormhole else ' ')
@@ -1526,7 +2496,8 @@ def gen_chain(t, bpe, mw, ch, cids, clen, has_weights, parl, periodic=None, inte
         else:
             text_parts = []
             printed = 0
-            for i in range(best_ol):
+            start_idx = display_start_index(bpe, best_out)
+            for i in range(start_idx, best_ol):
                 if printed >= 200:
                     break
                 s = bpe_decode_token(bpe, best_out[i])
@@ -1539,13 +2510,20 @@ def gen_chain(t, bpe, mw, ch, cids, clen, has_weights, parl, periodic=None, inte
             if wormhole:
                 sys.stdout.write("  {wormhole}")
             print()
-            out_text = "".join(text_parts)
+            out_text = "".join(text_parts).lstrip()
             ch.feel(out_text, periodic)
             if out_text:
                 ingest_ids(mw, bpe_encode(bpe, out_text.encode("utf-8", errors="replace"), len(out_text.encode("utf-8", errors="replace")), 256), 0.005)
+            local_phase = clampf(0.50 + 0.25 * best_sc + 0.04 * surface_coherence_score(bpe, best_out), 0.0, 1.0)
+            chunk_res = (float(len(active_chunk.get("heavy", []))) / 16.0) if active_chunk is not None else 0.0
+            phase_gate = update_phase_state(ch, local_phase, coherence_env_pressure(ch, cd, prophecy_pressure(mw), chunk_res))
 
         chain_ids[si] = list(best_out)
         chain_lens[si] = best_ol
+        events["prophecies"].append({"step": si, "pressure": prophecy_pressure(mw), "debt": ch.debt})
+        if parl is not None:
+            av = sum(e.vitality for e in parl.ex) / (parl.n if parl.n > 0 else 1)
+            events["parliament"].append({"step": si, "experts": parl.n, "winners": len(parl.last_winners), "diversity": parl.last_diversity, "avg_vitality": av, "births": parl.last_births, "deaths": parl.last_deaths, "consolidations": parl.last_consolidations})
         ch_xfire(ch, 3)
         ch.debt = 0.9 * ch.debt + 0.05
 
@@ -1564,17 +2542,18 @@ def gen_chain(t, bpe, mw, ch, cids, clen, has_weights, parl, periodic=None, inte
                 min_sc = spa_scores[i]
                 weak_idx = i
         avg_sc = sum(spa_scores) / CHAIN_STEPS
+        reseed_floor = avg_sc * (0.52 + 0.18 * (1.0 - phase_gate))
 
-        if min_sc < avg_sc * 0.6:  # slightly more aggressive threshold
+        if min_sc < reseed_floor:
             print("  [SPA-%d] reseeding step %d (score=%.2f, avg=%.2f)" % (spa_pass + 1, weak_idx + 1, min_sc, avg_sc))
             # use neighbor sentences as context for better continuity
             seed_src = weak_idx - 1 if weak_idx > 0 else (weak_idx + 1 if weak_idx < CHAIN_STEPS - 1 else 0)
             nprom = min(3, chain_lens[seed_src])
             prompt = chain_ids[seed_src][chain_lens[seed_src] - nprom:chain_lens[seed_src]]
             reseed_temp = 0.55 if has_weights else 0.7
-            result = gen_sent(t, bpe, mw, prompt, nprom, reseed_temp, 256, parl, gdest, ch)
-            new_sc = coherence_score(mw, result, len(result), t.V)
-            old_sc = coherence_score(mw, chain_ids[weak_idx], chain_lens[weak_idx], t.V)
+            result = gen_sent(t, bpe, mw, prompt, nprom, reseed_temp, 256, parl, gdest, ch, vel, doc_signal)
+            new_sc = coherence_score(mw, result, len(result), t.V) + 0.6 * surface_coherence_score(bpe, result)
+            old_sc = coherence_score(mw, chain_ids[weak_idx], chain_lens[weak_idx], t.V) + 0.6 * surface_coherence_score(bpe, chain_ids[weak_idx])
             if new_sc > old_sc * 0.7 or len(result) > chain_lens[weak_idx]:  # accept if reasonable
                 chain_ids[weak_idx] = list(result)
                 chain_lens[weak_idx] = len(result)
@@ -1597,12 +2576,14 @@ def gen_chain(t, bpe, mw, ch, cids, clen, has_weights, parl, periodic=None, inte
                 out_text = "".join(text_parts)
                 ch.feel(out_text, periodic)
                 ingest_ids(mw, result, 0.003)
+                phase_gate = update_phase_state(ch, clampf(0.48 + 0.22 * new_sc, 0.0, 1.0), coherence_env_pressure(ch, cd, prophecy_pressure(mw), 0.0))
         else:
             break  # no weak sentences, stop iterating
 
     # Hebbian decay
     for i in range(mw.n_hebb):
         mw.hebbs[i][2] *= 0.998
+    return events
 # ── main ──
 def main():
     print("PostGPT-Q \u2014 Resonant Reasoning Engine (Python)")
@@ -1678,8 +2659,15 @@ def main():
         t.clen = 0
         t.logits = [0.0] * t.V
 
-    if load_memory(mw, "q.memory", periodic, ch):
+    ch = Chambers()
+    ch_init(ch)
+    if load_memory_sqlite(mw, "q.sqlite", periodic, ch):
+        print("  [memory loaded: %d bi, %d tri, %d hebb from q.sqlite]" % (mw.n_bi, mw.n_tri, mw.n_hebb))
+    elif load_memory(mw, "q.memory", periodic, ch):
         print("  [memory loaded: %d bi, %d tri, %d hebb from q.memory]" % (mw.n_bi, mw.n_tri, mw.n_hebb))
+    spore_path = os.path.join("spores", "q.spore.bin")
+    if load_spore(mw, spore_path, periodic, ch):
+        print(f"  [spore loaded: {spore_path}]")
 
     interference = Interference()
     interference.load_docs("docs", bpe)
@@ -1687,16 +2675,14 @@ def main():
         print("[4.5] Interference...")
         print("  %d docs, %d heavy seeds" % (len(interference.docs), sum(len(doc["heavy"]) for doc in interference.docs)))
 
-    ch = Chambers()
-    ch_init(ch)
-
     print("[5] DOE Parliament...")
     parl = Parliament()
     parl_init(parl, t.D, 4)
     print("  %d experts, rank=%d, d_model=%d, alpha=%.2f" % (parl.n, DOE_RANK, t.D, parl.alpha))
+    run_events = new_experience_log()
 
     print("\n========== 12 BIDIRECTIONAL STEPS ==========")
-    gen_chain(t, bpe, mw, ch, cids, clen_corpus, has_weights, parl, periodic, interference)
+    merge_experience_log(run_events, gen_chain(t, bpe, mw, ch, cids, clen_corpus, has_weights, parl, periodic, interference))
 
     print("\ntype -> 12 sentences. 'quit' to exit.\n")
 
@@ -1716,14 +2702,17 @@ def main():
             ingest_ids(mw, uids)
             if len(uids) > 1:
                 print("  [ingested %d tokens: +bi +tri +hebb]" % len(uids))
-            gen_chain(t, bpe, mw, ch, cids, clen_corpus, has_weights, parl, periodic, interference, inp)
+            merge_experience_log(run_events, gen_chain(t, bpe, mw, ch, cids, clen_corpus, has_weights, parl, periodic, interference, inp))
     except (KeyboardInterrupt, EOFError):
         pass
 
     # save memory
     try:
+        consolidate_experience(mw, periodic, ch, run_events)
+        save_memory_sqlite(mw, "q.sqlite", periodic, ch, run_events)
         save_memory(mw, "q.memory", periodic, ch)
-        print("  [memory saved: %d bi, %d tri, %d hebb, %d periodic \u2192 q.memory]" % (mw.n_bi, mw.n_tri, mw.n_hebb, len(periodic.elements)))
+        save_spore(mw, spore_path, periodic, ch)
+        print("  [memory saved: %d bi, %d tri, %d hebb, %d periodic \u2192 q.sqlite + q.memory]" % (mw.n_bi, mw.n_tri, mw.n_hebb, len(periodic.elements)))
     except Exception:
         pass
 

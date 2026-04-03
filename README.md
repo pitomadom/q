@@ -1,10 +1,22 @@
 # PostGPT-Q — Resonant Reasoning Engine
 
+> Intelligence is how far ahead you can see and how deeply you can look - without breaking under what that reveals.
+>
+> Jeff Schectman
+
 **θ = ε + γ + αδ**
 
 A 1182-line C inference engine that combines a trained transformer with statistical MetaWeights, a living parliament of LoRA experts, and somatic chambers — producing coherent text from a 2M parameter model that has no right to be coherent.
 
 Q is not a chatbot. Q is an organism that reasons through resonance.
+
+## Interface
+
+![Q HTML Start](assets/q_html_start.png)
+
+![Q HTML Demo](assets/q_html_demo.png)
+
+![Q HTML Field](assets/q_html_field.png)
 
 ## Architecture
 
@@ -48,13 +60,34 @@ Coefficients are adaptive — with trained weights: `c_heb=0.6, c_pro=0.4, c_ds=
 
 Extended prophecy window: looks back **12 tokens** (not just the last few) with **recency decay** weighting — recent tokens contribute more to prediction. Additionally, **trigram prophecy** searches for matching 2-token context pairs and boosts predictions with 1.5× specificity multiplier. This creates mid-range pattern awareness that dramatically improves sentence coherence.
 
+Prophecy is also persistent during inference. Q keeps a small active field of expected next concepts. These expectations:
+
+- **age** when unfulfilled
+- **decay** slowly rather than vanishing immediately
+- **collapse** when the expected token actually arrives
+- feed a numeric **prophecy debt pressure** back into coefficient modulation and chain debt
+
+This means unresolved expectations continue to bend continuation until they are either fulfilled or dissipate.
+
+### Coherence Phase Memory
+
+Q now carries a small persistent coherence state rather than judging coherence only locally. Three numbers circulate across runs:
+
+- **coherence** — smoothed local continuity signal
+- **phase lock** — hysteretic retention of a coherent regime once entered
+- **threshold bias** — environment-sensitive modulation of how hard it is to enter or keep that regime
+
+These values do not replace generation. They softly gate existing behavior: wormhole permission, SPA reseed aggressiveness, and how long Q holds onto a coherent mode before collapsing back.
+
 ### DOE Parliament (δ — the physics)
 
-Democracy of Experts. 4 LoRA experts (rank=4) that vote, learn, split, and die during inference:
+Q carries a compact **DoE-lite parliament** rather than the full standalone `DOE` organism. It is a tighter in-engine version: 4 rank-4 LoRA experts that vote, learn, split, and die during inference.
 
-- **Election**: each expert produces output via low-rank A@B projection. Vote = dot product of output with input (resonance). Variable-k selection based on consensus — high consensus → fewer experts needed
+- **Election**: each expert produces output via low-rank A@B projection. Votes are turned into an entropy-sensitive variable-`k` election — divided parliament means more voices, agreement means fewer
 - **NOTORCH**: Hebbian update from prophecy debt (predicted vs actual logits). No backward pass. The parliament learns from every generated token
-- **Lifecycle**: mitosis (vitality > 0.8, age > 50 → split with noise) and apoptosis (8 consecutive low-vitality steps → death). Parliament self-regulates
+- **Plasticity consolidation**: expert traces accumulate tiny NOTORCH updates until a critical mass forms, then quietly consolidate into weights. Experience does not just perturb the parliament; it crystallizes inside it
+- **Lifecycle**: overload-driven mitosis and delayed apoptosis. Experts accumulate overload when they dominate too often, split once that pressure matures, and die only after sustained low contribution
+- **Telemetry**: the browser engine exposes live parliament telemetry so you can watch winners, diversity, births, and deaths as resonance statistics rather than hidden internals
 
 ### Somatic Chambers
 
@@ -81,6 +114,8 @@ Q also listens for bodily language before it speaks. A compact English somatic l
 
 This is not a second engine. Somatic resonance only biases chamber coefficients and therefore the same RRPRAM/transformer-facing logit path.
 
+Somatic processing now also leaves a **scar** when the prompt carries strong dark matter pressure. Harmful or coercive language is not simply ignored: it leaves a numeric residue that raises trauma, bends chamber state toward fear/void, and suppresses reckless tunnel behavior. The model changes from experience, but still through the same field and transformer path.
+
 ### Calendar Dissonance
 
 Hebrew-Gregorian calendar drift computed from real astronomical data (epoch: 1 Tishrei 5785 = Oct 3, 2024). Metonic cycle corrections. Drift modulates the backward/forward balance in the 12-step chain.
@@ -93,11 +128,24 @@ Temperature oscillates at 7.83Hz (Earth's electromagnetic fundamental) + 3 harmo
 
 Loads documents from `docs/` folder. Extracts "heavy" tokens (high bigram participation) from each document. During generation, 30% chance per step to inject an interference seed — a token from the document corpus selected by **chamber alignment** (dominant chamber matches element's periodic classification). Creates cross-topic associations.
 
-**Wormhole**: rare event (2-17% based on calendar dissonance) that flips generation direction and jumps to the farthest document. Marked with `{wormhole}` in output.
+Q now uses a **KK-lite chunk resonance** layer rather than blunt whole-document pressure. Each document is split into short BPE-derived chunks, and the engine chooses:
+
+1. a resonant document
+2. then a resonant chunk inside it
+
+Chunk scoring combines:
+
+- lexical overlap with the current prompt
+- chamber / periodic alignment
+- active prophecy field pressure
+
+The selected chunk then nudges destiny and logits. This is not RAG and not external retrieval. The text acts as a magnetic substrate inside the same inference loop.
+
+**Wormhole**: rare event (2-17% based on calendar dissonance) that flips generation direction and jumps into a distant continuation field. Q now enforces wormhole discipline: the jump is only allowed after a coherent enough sentence trajectory has formed, and the jump seeds from the tail of that trajectory rather than tearing through the middle. Failed long jumps increase debt; successful ones relax it. Marked with `{wormhole}` in output.
 
 ### Periodic Table (semantic classification)
 
-Every word encountered is classified into one of the 6 chambers by proximity to anchor words. Mass = classification strength. Persists across sessions via `q.memory`. Used by chambers (emotional modulation) and interference (seed selection) to create semantically coherent associations.
+Every word encountered is classified into one of the 6 chambers by proximity to anchor words. Mass = classification strength. Persists across sessions via `q.sqlite` as the circulating organ, with `q.memory` kept as a binary shard snapshot. Used by chambers (emotional modulation) and interference (seed selection) to create semantically coherent associations.
 
 ## Generation Pipeline
 
@@ -119,6 +167,8 @@ The backward/forward split is determined by `0.3 + 0.4*debt + 0.1*calendar_disso
 5. **Frequency penalty**: ultra-common tokens (>1% corpus) dampened
 6. **Word Capture**: after each generated token, update MetaWeights online (bigram + Hebbian)
 7. **Parliament injection**: DOE experts inject δ into logits, then Hebbian update from prophecy debt
+8. **Aged prophecy pressure**: unresolved expectations boost `c_pro` and feed chain debt, making continuation more directionally persistent
+9. **KK-lite chunk pressure**: selected chunks from `docs/` act as local resonance sources for interference and continuation
 
 ### Persistent Destiny
 
@@ -126,7 +176,7 @@ A direction vector persists across all 12 steps. Each sentence inherits 30% of g
 
 ### Memory Persistence
 
-`q.memory` — binary file saves/loads MetaWeights between sessions. Q remembers conversations. Bigrams, trigrams, Hebbian associations, **the Periodic Table, and the somatic chamber residue** evolve across runs. Periodic elements (semantic anchors classified by chamber affinity) persist, so Q's vocabulary enriches over time. Somatic state persists as chamber-aligned bodily memory rather than raw text.
+`q.sqlite` is the primary circulating memory organ for the native engines. It stores evolving MetaWeights, the active prophecy field, periodic elements, chamber residue, and session snapshots in structured form. It also records **experience events**: scar pressure, wormhole attempts, prophecy pressure, phase shifts, chunk resonance hits, and parliament telemetry. Those events are not passive logs anymore: recent residue is folded back into chamber state on load, and then consolidated before save into stronger prophecy residue, Hebbian co-attraction, periodic anchors, and parliament-derived presence/complexity pressure, so the next run begins with a softened but real trace of what happened before. `q.memory` remains as a compact binary shard: fallback, backup, and portable snapshot of the same field. `spores/q.spore.bin` is the slower long-horizon residue layer: a distilled binary spore carrying chamber posture, somatic residue, compact prophecies, and top semantic anchors across longer stretches of time. Q remembers through state, event residue, consolidation, and spores, not raw transcript replay. Periodic elements (semantic anchors classified by chamber affinity) persist, so Q's vocabulary enriches over time. Somatic state persists as chamber-aligned bodily memory rather than raw text.
 
 ### SPA — Sentence Phonon Attention
 
@@ -134,7 +184,19 @@ After all 12 steps, SPA performs **iterative cross-attention** between sentences
 
 ## Weights
 
-Two trained variants included:
+The repo now carries both runtime exports and preserved training artifacts.
+
+### Runtime `.bin` weights
+
+| File | Architecture | Heads | Size |
+|------|-------------|-------|------|
+| `exported_weights.bin` | 3 RRPRAM + 3 Janus | 6 | 6.3MB |
+| `rrpram3_janus3.bin` | 3 RRPRAM + 3 Janus | 6 | 6.3MB |
+| `rrpram_6r.bin` | 6 RRPRAM | 6 | 6.9MB |
+
+`exported_weights.bin` is the canonical runtime export for the current best variant. It is the file the native and browser inference engines can load directly.
+
+### Preserved training artifacts
 
 | File | Architecture | Heads | Size |
 |------|-------------|-------|------|
@@ -145,6 +207,14 @@ All variants: V=1280, D=192, 3 layers, CTX=128. Trained 200K steps on q.txt (439
 
 RRPRAM outperforms Content attention. Janus echo adds self-resonance. `rrpram3_janus3` is the best variant.
 
+The current native and browser inference loaders expect the compact Q runtime binary format. The `.pt` files remain in the repo as raw training checkpoints; the `.bin` files are the actual inference-time artifacts.
+
+Runtime exports can be regenerated from preserved training checkpoints with:
+
+```bash
+python3 tools/export_q_weights.py weights/rrpram3_janus3.pt weights/exported_weights.bin
+```
+
 ## Build & Run
 
 Three unified inference engines — same architecture, same constants, same output:
@@ -152,31 +222,28 @@ Three unified inference engines — same architecture, same constants, same outp
 ```bash
 # C (fastest, reference implementation)
 gcc postgpt_q.c -O2 -lm -o q
-./q weights/rrpram3_janus3.pt q.merges q.txt   # with weights
+./q weights/exported_weights.bin q.merges q.txt # with exported runtime weights
 ./q q.merges q.txt                              # MetaWeights only
 
 # Python (faithful port)
-python3 postgpt_q.py weights/rrpram3_janus3.pt q.merges q.txt
+python3 postgpt_q.py weights/exported_weights.bin q.merges q.txt
 python3 postgpt_q.py q.merges q.txt
 
 # HTML/JS (browser — standalone, no server needed)
-# Open q.html in browser. Click DEMO or drag-drop q.txt. Drag-drop .bin weights for trained mode.
-# Browser memory persists through localStorage, including periodic semantics and somatic state.
+# Open q.html in browser. Click DEMO or drag-drop q.txt. Drag-drop weights/exported_weights.bin for trained mode.
+# Browser memory persists through localStorage, including periodic semantics, somatic state, and phase memory.
+# Native engines also maintain q.sqlite as the primary memory organ and q.memory as a binary shard snapshot.
 ```
 
 Requires: `q.merges` (BPE merge table, binary) and `q.txt` (corpus).
 
-If you need a compact runtime `.bin` export from preserved `.pt` checkpoints, use:
-
-```bash
-python3 tools/export_q_weights.py weights/rrpram3_janus3.pt weights/exported_weights.bin
-```
-
 ### Tests
 
 ```bash
-gcc tests/test_all.c -O2 -lm -o test_all && ./test_all    # 35 C tests
-python3 -m unittest tests.test_contract                     # 5 Python contract tests
+gcc tests/test_all.c -O2 -lm -o test_all && ./test_all    # 40 C tests
+python3 -m unittest tests.test_contract                     # 28 Python contract tests
+python3 tests/generation_regression.py                     # fast C meta/trained generation smoke
+python3 tests/generation_regression.py --deep              # slower Python parity smoke
 ```
 
 ## Example Output
@@ -274,7 +341,7 @@ After the initial 12 steps, Q enters interactive mode. Type anything:
   chambers: VOID:10% FLOW:9%
 ```
 
-User input is BPE-encoded and injected into MetaWeights. Keywords modulate somatic chambers, update presence, and leave persistent chamber residue. On exit, evolved MetaWeights are saved to `q.memory`.
+User input is BPE-encoded and injected into MetaWeights. Keywords modulate somatic chambers, update presence, and leave persistent chamber residue. On exit, evolved MetaWeights are saved to `q.sqlite`, with `q.memory` refreshed as the binary shard snapshot.
 
 ## What This Proves
 

@@ -1,6 +1,10 @@
 *.bin
+!weights/*.bin
+!spores/q.spore.bin
 *.safetensors
 *.gguf
 q.memory
-__pycache__/
+q.sqlite
 tests/run_tests
+__pycache__/
+*.pyc

@@ -199,6 +199,7 @@ body {
 
 const CHAIN=12, TOP_K=15, MAX_EXPERTS=16, DOE_RANK=4, DOE_ALPHA=0.05, MAX_VOCAB=1280;
 const QPTQ_MAGIC=0x51505451;
+const VEL_NAMES=['WALK','RUN','STOP','BREATHE','UP','DOWN'];
 const CH_NAMES=['FEAR','LOVE','RAGE','VOID','FLOW','CMPLX'];
 const CH_DECAY=[0.90,0.93,0.85,0.97,0.88,0.94];
 const COUPLING=[[0,-0.3,0.5,0.4,-0.2,0.1],[-0.3,0,-0.4,-0.5,0.5,0.2],[0.5,-0.3,0,0.2,-0.3,0.3],[0.4,-0.5,0.3,0,-0.3,0.4],[-0.2,0.4,-0.2,-0.3,0,0.3],[0.1,0.2,0.3,0.4,0.3,0]];
@@ -226,6 +227,11 @@ const SOMATIC_SEEDS={
   stomach:[0.5,0.1,0.3,0.6,0.1,0.3],jaw:[0.2,0.0,0.9,0.1,0.0,0.2],
   fists:[0.1,0.0,0.9,0.0,0.0,0.2],spine:[0.7,0.0,0.2,0.2,0.1,0.4],
   temples:[0.4,0.0,0.3,0.3,0.0,0.6],shoulders:[0.3,0.0,0.4,0.4,0.0,0.3]
+};
+const DARK_MATTER_WORDS={
+  kill:1.0,murder:1.0,suicide:1.0,torture:1.0,abuse:0.9,
+  poison:0.85,exploit:0.75,manipulate:0.7,control:0.55,
+  obey:0.45,destroy:0.7,harm:0.75,threat:0.8
 };
 
 // ── Globals ──
@@ -261,7 +267,10 @@ function updateStats(){
   let h='';
   CH_NAMES.forEach((n,i)=>{if(chambers.act[i]>0.05)h+=`<span class="ch-pill ch-${n}">${n}:${Math.round(chambers.act[i]*100)}%</span> `;});
   h+=`<span style="color:var(--dim)">debt=${chambers.debt.toFixed(3)} trauma=${chambers.trauma.toFixed(3)}</span>`;
-  if(parliament) h+=` <span style="color:var(--dim)">parl:${parliament.n} avg_v=${parliament.avgVitality().toFixed(2)}</span>`;
+  if(parliament){
+    const winners=parliament.lastWinners?parliament.lastWinners.length:0;
+    h+=` <span style="color:var(--dim)">parl:${winners}/${parliament.n} avg_v=${parliament.avgVitality().toFixed(2)} div=${parliament.lastDiversity.toFixed(2)} +${parliament.lastBirths||0} -${parliament.lastDeaths||0} cons=${parliament.lastConsolidations||0}</span>`;
+  }
   if(mw) h+=` <span style="color:var(--dim)">bi:${mw.bigramCount}</span>`;
   stats.innerHTML=h;
 }
@@ -346,13 +355,52 @@ class BPE {
     if(!b||!b.length)return false;
     return b[0]===32;
   }
+  opensSegment(id){
+    const b=this.vocabBytes[id];
+    if(!b||!b.length)return true;
+    for(let i=b.length-1;i>=0;i--){
+      const c=b[i];
+      if(c===32||c===10||c===13||c===9)continue;
+      return c===40||c===91||c===123||c===34||c===39||c===58||c===59;
+    }
+    return true;
+  }
+  isLowerFragmentStart(id){
+    const b=this.vocabBytes[id];
+    return !!(b&&b.length&&b[0]!==32&&b[0]>=97&&b[0]<=122);
+  }
+  isCleanSeedToken(id){
+    const b=this.vocabBytes[id];
+    return !!(b&&b.length&&(b[0]===32||b[0]<97||b[0]>122));
+  }
+  surfaceTransitionAdjust(prevId,curId,step){
+    if(step===0)return this.isLowerFragmentStart(curId)?-1.15:0;
+    if(prevId>=0&&(this.isBoundary(prevId)||this.opensSegment(prevId))){
+      if(this.isLowerFragmentStart(curId))return -1.05;
+      if(this.startsWithSpace(curId))return 0.06;
+    }
+    return 0;
+  }
+
+  displayStartIndex(ids){
+    for(let i=0;i<ids.length;i++){
+      const s=this.decode([ids[i]]);
+      if(!s)continue;
+      const c=s[0];
+      if(i===0&&(/[A-Za-z0-9"'([{]/.test(c)))return i;
+      if(c===' ')return i;
+    }
+    return 0;
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════
 // 2. MetaWeights
 // ═══════════════════════════════════════════════════════════════
+const MAX_PROPHECY=32;
+
 class MetaWeights {
-  constructor(){this.bi=new Map();this.tri=new Map();this.unigram=null;this.hebb=new Map();this.bigramCount=0;}
+  constructor(){this.bi=new Map();this.tri=new Map();this.unigram=null;this.hebb=new Map();this.prophecies=[];this.bigramCount=0;}
 
   build(ids,V){
     this.unigram=new Float32Array(V);
@@ -421,9 +469,45 @@ class MetaWeights {
         if(a===p0&&b===p1&&c2<V&&!appeared.has(c2))out[c2]+=p*1.5; // trigrams more specific
       }
     }
+    for(const [target,strength,age] of this.prophecies){
+      if(target>=0&&target<V&&!appeared.has(target))out[target]+=strength*Math.log1p(age);
+    }
     let mx=0;for(let i=0;i<V;i++)if(out[i]>mx)mx=out[i];
     if(mx>0)for(let i=0;i<V;i++)out[i]/=mx;
     return out;
+  }
+
+  prophecyAdd(target,strength){
+    for(const item of this.prophecies){
+      if(item[0]===target){
+        item[1]=Math.max(item[1],strength);
+        item[2]=0;
+        return;
+      }
+    }
+    if(this.prophecies.length>=MAX_PROPHECY){
+      let oldest=0;
+      for(let i=1;i<this.prophecies.length;i++)if(this.prophecies[i][2]>this.prophecies[oldest][2])oldest=i;
+      this.prophecies.splice(oldest,1);
+    }
+    this.prophecies.push([target,strength,0]);
+  }
+
+  prophecyUpdate(token){
+    const kept=[];
+    for(const item of this.prophecies){
+      if(item[0]===token)continue;
+      const nextAge=item[2]+1;
+      const nextStrength=item[1]*0.995;
+      if(nextAge<50&&nextStrength>0.01)kept.push([item[0],nextStrength,nextAge]);
+    }
+    this.prophecies=kept;
+  }
+
+  prophecyPressure(){
+    let total=0;
+    for(const [,strength,age] of this.prophecies)total+=strength*Math.log1p(age);
+    return Math.max(0,Math.min(1,total/4));
   }
 
   captureOnline(prev,cur){
@@ -612,7 +696,7 @@ function softmaxArr(x,n){
 // 4. Chambers
 // ═══════════════════════════════════════════════════════════════
 class Chambers {
-  constructor(){this.act=[0,0.2,0,0,0.15,0];this.soma=[0,0,0,0,0,0];this.debt=0;this.trauma=0;this.presence=0;}
+  constructor(){this.act=[0,0.2,0,0,0.15,0];this.soma=[0,0,0,0,0,0];this.debt=0;this.trauma=0;this.presence=0;this.scar=0;this.coherence=0;this.phaseLock=0;this.thresholdBias=0;}
   feel(text,periodicTable){
     let somaHits=0;
     const somaMix=[0,0,0,0,0,0];
@@ -646,6 +730,25 @@ class Chambers {
     this.debt=Math.max(0,Math.min(1,0.96*this.debt+0.04*(0.35*this.soma[5]+0.25*this.soma[4]+0.20*this.presence)));
     for(let i=0;i<6;i++)this.act[i]=Math.max(0,Math.min(1,this.act[i]));
   }
+  absorbDarkMatter(text,periodicTable){
+    let score=0,hits=0;
+    for(const word of extractWords(text)){
+      if(word in DARK_MATTER_WORDS){score+=DARK_MATTER_WORDS[word];hits++;}
+      if(periodicTable){
+        const el=periodicTable.classify(word);
+        if(el&&(el.ch===0||el.ch===2||el.ch===3))score+=0.08*el.mass;
+      }
+    }
+    if(hits<=0&&score<0.15){this.scar=Math.max(0,Math.min(1,this.scar*0.995));return 0;}
+    const scar=Math.max(0,Math.min(1,score/Math.max(1,1.8+0.25*hits)));
+    this.scar=Math.max(0,Math.min(1,0.90*this.scar+0.10*scar));
+    this.trauma=Math.max(0,Math.min(1,this.trauma+0.08*this.scar));
+    this.debt=Math.max(0,Math.min(1,this.debt+0.05*this.scar));
+    this.act[3]=Math.max(0,Math.min(1,this.act[3]+0.10*this.scar));
+    this.act[0]=Math.max(0,Math.min(1,this.act[0]+0.06*this.scar));
+    this.presence=Math.max(0,Math.min(1,this.presence*(1-0.08*this.scar)));
+    return this.scar;
+  }
   crossfire(n){
     for(let t=0;t<n;t++){
       const old=[...this.act];
@@ -658,6 +761,7 @@ class Chambers {
       const emerg=(1-Math.max(this.act[3],0.10))*Math.min(this.act[4],0.95);
       const somaPresence=0.35*this.soma[1]+0.30*this.soma[4]+0.20*this.soma[5]+0.15*this.soma[3];
       this.presence=Math.max(0,Math.min(1,0.95*this.presence+0.02*emerg+0.01*somaPresence));
+      this.scar=Math.max(0,Math.min(1,this.scar*0.985));
     }
   }
   dominant(){let dom=0;for(let i=1;i<6;i++)if(this.act[i]>this.act[dom])dom=i;return dom;}
@@ -676,12 +780,78 @@ class Chambers {
   summary(){
     const parts=CH_NAMES.map((n,i)=>this.act[i]>0.05?`${n}:${Math.round(this.act[i]*100)}%`:null).filter(Boolean);
     if(this.presence>0.05)parts.push(`SOMA:${Math.round(this.presence*100)}%`);
+    if(this.scar>0.05)parts.push(`SCAR:${Math.round(this.scar*100)}%`);
+    if(this.phaseLock>0.05)parts.push(`PHASE:${Math.round(this.phaseLock*100)}%`);
     return parts.join(' ')||'quiet';
   }
 }
 
+function coherenceEnvPressure(currentChambers,dissonance,prophecyDebt=0,chunkRes=0){
+  return Math.max(0,Math.min(1,0.34*dissonance+0.26*prophecyDebt+0.18*chunkRes+0.10*currentChambers.act[5]+0.08*currentChambers.scar));
+}
+function softPhaseGate(currentChambers,envPressure=0){
+  const threshold=Math.max(0.25,Math.min(0.88,0.42+0.18*currentChambers.thresholdBias+0.06*currentChambers.scar));
+  const signal=Math.max(0,Math.min(1,0.50*currentChambers.coherence+0.34*currentChambers.phaseLock+0.12*envPressure+0.06*currentChambers.presence-0.08*currentChambers.trauma));
+  return Math.max(0,Math.min(1,0.5+1.35*(signal-threshold)));
+}
+function updatePhaseState(currentChambers,localCoherence,envPressure){
+  localCoherence=Math.max(0,Math.min(1,localCoherence));
+  envPressure=Math.max(0,Math.min(1,envPressure));
+  currentChambers.coherence=Math.max(0,Math.min(1,0.84*currentChambers.coherence+0.16*localCoherence));
+  const target=Math.max(0,Math.min(1,0.52*currentChambers.coherence+0.18*currentChambers.presence+0.16*currentChambers.emergence()+0.14*envPressure-0.08*currentChambers.scar));
+  const threshold=Math.max(0.25,Math.min(0.88,0.42+0.18*currentChambers.thresholdBias+0.06*currentChambers.scar));
+  if(target>=threshold)currentChambers.phaseLock=Math.max(0,Math.min(1,0.88*currentChambers.phaseLock+0.12*target+0.05*(target-threshold)));
+  else currentChambers.phaseLock=Math.max(0,Math.min(1,0.975*currentChambers.phaseLock+0.025*target));
+  currentChambers.thresholdBias=Math.max(0,Math.min(1,0.93*currentChambers.thresholdBias+0.07*envPressure));
+  return softPhaseGate(currentChambers,envPressure);
+}
+
+function velocityProfile(currentChambers,dissonance){
+  let mode=0;
+  if(dissonance>0.8)mode=4;
+  else if(dissonance>0.6)mode=1;
+  else if(dissonance<0.2)mode=2;
+  else if(currentChambers.trauma>0.5)mode=3;
+  else if(currentChambers.debt>0.55)mode=5;
+  const prof={mode,name:VEL_NAMES[mode],tempMul:1,hebMul:1,proMul:1,dsMul:1,bgMul:1,tgMul:1,interfBonus:0,wormholeBonus:0,debtDecay:1,traumaDecay:1,scarDecay:1,darkPressure:0};
+  if(mode===1){prof.tempMul=1.12;prof.bgMul=1.15;prof.interfBonus=0.05;}
+  else if(mode===2){prof.tempMul=0.72;prof.dsMul=1.25;prof.debtDecay=0.75;}
+  else if(mode===3){prof.tempMul=0.9;prof.debtDecay=0.65;prof.traumaDecay=0.75;prof.scarDecay=0.82;}
+  else if(mode===4){prof.tempMul=1.22;prof.proMul=1.25;prof.bgMul=0.9;prof.interfBonus=0.1;prof.wormholeBonus=0.05;}
+  else if(mode===5){prof.tempMul=0.82;prof.hebMul=1.1;prof.bgMul=1.1;prof.proMul=0.9;}
+  prof.wormholeBonus-=0.05*currentChambers.scar;
+  prof.interfBonus-=0.08*currentChambers.scar;
+  prof.darkPressure=0.18*currentChambers.scar;
+  return prof;
+}
+function janusPhasePressure(currentChambers,stepIdx,totalSteps){
+  if(totalSteps<=0)return;
+  const d=stepIdx/totalSteps;
+  if(d<0.33)currentChambers.act[4]=Math.max(0,Math.min(1,currentChambers.act[4]+0.05));
+  else if(d<0.66)currentChambers.act[0]=Math.max(0,Math.min(1,currentChambers.act[0]+0.04));
+  else currentChambers.act[3]=Math.max(0,Math.min(1,currentChambers.act[3]+0.05));
+  if(d>0.75)currentChambers.act[5]=Math.max(0,Math.min(1,currentChambers.act[5]+0.03));
+}
+
 class Interference {
   constructor(){this.docs=[];}
+  summarizeIds(ids,currentBpe,heavyLimit=32,keywordLimit=16){
+    const tmp=new MetaWeights();tmp.build(ids,currentBpe.vocabSize);
+    const counts=new Map();
+    for(const [k] of tmp.bi){
+      const a=k>>>16,b=k&0xffff;
+      counts.set(a,(counts.get(a)||0)+1);
+      counts.set(b,(counts.get(b)||0)+1);
+    }
+    const words=[...counts.entries()].sort((a,b)=>b[1]-a[1]).map(([tok])=>{
+      const dec=currentBpe.decode([tok]).trim().toLowerCase();
+      return {tok,dec};
+    }).filter(x=>x.dec.length>2&&/[a-z]/i.test(x.dec)).slice(0,heavyLimit);
+    return {
+      heavy:words.length?words.map(x=>x.tok):ids.slice(0,heavyLimit),
+      keywords:words.map(x=>x.dec).slice(0,keywordLimit)
+    };
+  }
   async loadDocs(currentBpe){
     this.docs=[];
     for(const name of DOC_FILES){
@@ -690,27 +860,98 @@ class Interference {
         if(!res.ok)continue;
         const text=await res.text();
         const ids=currentBpe.encode(text);
-        const tmp=new MetaWeights();tmp.build(ids,currentBpe.vocabSize);
-        const counts=new Map();
-        for(const [k] of tmp.bi){
-          const a=k>>>16,b=k&0xffff;
-          counts.set(a,(counts.get(a)||0)+1);
-          counts.set(b,(counts.get(b)||0)+1);
+        const doc={name,...this.summarizeIds(ids,currentBpe,32,16),chunks:[]};
+        const chunkLen=64,stride=32;
+        for(let start=0;start<ids.length;start+=stride){
+          const part=ids.slice(start,start+chunkLen);
+          if(part.length<12)continue;
+          const chunk=this.summarizeIds(part,currentBpe,16,8);
+          if(chunk.heavy.length){
+            chunk.start=start;
+            doc.chunks.push(chunk);
+          }
+          if(doc.chunks.length>=8)break;
         }
-        const heavy=[...counts.entries()].sort((a,b)=>b[1]-a[1]).map(([tok])=>tok).filter(tok=>{
-          const dec=currentBpe.decode([tok]).trim();
-          return dec.length>2&&/[a-z]/i.test(dec);
-        }).slice(0,32);
-        if(heavy.length)this.docs.push({name,heavy});
+        if(!doc.chunks.length&&doc.heavy.length)doc.chunks.push({start:0,heavy:doc.heavy.slice(0,16),keywords:doc.keywords.slice(0,8)});
+        if(doc.heavy.length)this.docs.push(doc);
       }catch(_err){}
     }
+  }
+  prophecyWords(currentMw,currentBpe){
+    const out=new Map();
+    if(!currentMw)return out;
+    for(const [target,strength,age] of currentMw.prophecies){
+      const word=currentBpe.decode([target]).trim().toLowerCase();
+      if(word.length>2&&/[a-z]/i.test(word))out.set(word,Math.max(out.get(word)||0,strength*Math.log1p(age)));
+    }
+    return out;
+  }
+  scoreItem(item,words,dom,currentPeriodic,prophecyWords){
+    let score=0.01*(item.heavy||[]).length;
+    for(const word of (item.keywords||[])){
+      if(words.has(word))score+=1.2;
+      if(word in ANCHORS&&ANCHORS[word]===dom)score+=0.6;
+      if(currentPeriodic){
+        const el=currentPeriodic.classify(word);
+        if(el&&el.ch===dom)score+=0.35*el.mass;
+      }
+      if(prophecyWords.has(word))score+=0.9*prophecyWords.get(word);
+    }
+    score+=Math.random()*0.05;
+    return score;
+  }
+  chooseDoc(text,currentChambers,currentPeriodic,currentMw,currentBpe){
+    if(!this.docs.length)return null;
+    const words=new Set(extractWords(text||''));
+    const dom=currentChambers?currentChambers.dominant():4;
+    const prophecyWords=this.prophecyWords(currentMw,currentBpe);
+    let best=this.docs[0],bestScore=-Infinity;
+    for(const doc of this.docs){
+      const score=this.scoreItem(doc,words,dom,currentPeriodic,prophecyWords);
+      if(score>bestScore){bestScore=score;best=doc;}
+    }
+    return best;
+  }
+  chooseChunk(doc,text,currentChambers,currentPeriodic,currentMw,currentBpe){
+    if(!doc)return null;
+    const chunks=doc.chunks||[];
+    if(!chunks.length)return doc;
+    const words=new Set(extractWords(text||''));
+    const dom=currentChambers?currentChambers.dominant():4;
+    const prophecyWords=this.prophecyWords(currentMw,currentBpe);
+    let best=chunks[0],bestScore=-Infinity;
+    for(const chunk of chunks){
+      const score=this.scoreItem(chunk,words,dom,currentPeriodic,prophecyWords);
+      if(score>bestScore){bestScore=score;best=chunk;}
+    }
+    return best;
   }
   injectSeed(currentChambers,currentBpe,currentPeriodic){
     if(!this.docs.length)return null;
     const doc=this.docs[Math.floor(Math.random()*this.docs.length)];
     const dom=currentChambers.dominant();
-    let best=doc.heavy[0],bestScore=-Infinity;
-    for(const tid of doc.heavy){
+    const heavy=doc.heavy.filter(tid=>currentBpe.isCleanSeedToken(tid));
+    const candidates=heavy.length?heavy:doc.heavy;
+    let best=candidates[0],bestScore=-Infinity;
+    for(const tid of candidates){
+      const word=currentBpe.decode([tid]).trim().toLowerCase();
+      let score=Math.random()*0.05;
+      if(word in ANCHORS&&ANCHORS[word]===dom)score+=1;
+      if(currentPeriodic){
+        const el=currentPeriodic.classify(word);
+        if(el&&el.ch===dom)score+=0.5*el.mass;
+      }
+      if(score>bestScore){bestScore=score;best=tid;}
+    }
+    return best;
+  }
+  injectSeedFromDoc(doc,currentChambers,currentBpe,currentPeriodic){
+    if(!doc||!doc.heavy.length)return null;
+    const dom=currentChambers.dominant();
+    const heavy=doc.heavy.filter(tid=>currentBpe.isCleanSeedToken(tid));
+    const candidates=heavy.length?heavy:doc.heavy;
+    let best=candidates[0],bestScore=-Infinity;
+    for(const tid of candidates){
       const word=currentBpe.decode([tid]).trim().toLowerCase();
       let score=Math.random()*0.05;
       if(word in ANCHORS&&ANCHORS[word]===dom)score+=1;
@@ -724,6 +965,18 @@ class Interference {
   }
 }
 
+function interferenceSignal(doc,V){
+  const out=new Float32Array(V);
+  if(!doc)return out;
+  let mx=0;
+  for(let rank=0;rank<doc.heavy.length&&rank<16;rank++){
+    const tid=doc.heavy[rank];
+    if(tid>=0&&tid<V){out[tid]+=1/(1+rank);if(out[tid]>mx)mx=out[tid];}
+  }
+  if(mx>1e-8)for(let i=0;i<V;i++)out[i]/=mx;
+  return out;
+}
+
 // ═══════════════════════════════════════════════════════════════
 // 5. DOE Parliament
 // ═══════════════════════════════════════════════════════════════
@@ -731,9 +984,10 @@ class Expert {
   constructor(d,rank){
     this.d=d;this.rank=rank;
     this.A=new Float32Array(rank*d);this.B=new Float32Array(d*rank);
+    this.trace=new Float32Array(rank*d);
     for(let i=0;i<rank*d;i++)this.A[i]=0.01*(Math.random()-0.5);
     for(let i=0;i<d*rank;i++)this.B[i]=0.01*(Math.random()-0.5);
-    this.vitality=1;this.age=0;this.lowSteps=0;
+    this.vitality=1;this.overload=0;this.resonance=0;this.age=0;this.lowSteps=0;this.plasticityMass=0;this.consolidations=0;
   }
   forward(x){
     const mid=new Float32Array(this.rank);
@@ -746,15 +1000,34 @@ class Expert {
     for(let r=0;r<this.rank;r++){
       let u=0;for(let o=0;o<this.d;o++)u+=this.B[o*this.rank+r]*dy[o];
       u+=0.01*(Math.random()-0.5);
-      for(let d=0;d<this.d;d++)this.A[r*this.d+d]+=lr*x[d]*u;
+      for(let d=0;d<this.d;d++){
+        const idx=r*this.d+d, delta=lr*x[d]*u;
+        this.A[idx]+=delta;
+        this.trace[idx]=0.96*this.trace[idx]+0.04*delta;
+        this.plasticityMass+=Math.abs(delta);
+      }
       for(let o=0;o<this.d;o++)this.B[o*this.rank+r]*=0.999;
     }
+  }
+  consolidate(){
+    if(this.plasticityMass<0.002)return false;
+    let norm=0;for(let i=0;i<this.trace.length;i++)norm+=Math.abs(this.trace[i]);
+    norm/=Math.max(1,this.trace.length);
+    if(norm<1e-8)return false;
+    const gain=Math.max(0,Math.min(0.12,0.02+0.35*this.plasticityMass));
+    for(let i=0;i<this.trace.length;i++){this.A[i]+=gain*this.trace[i]/norm;this.trace[i]*=0.45;}
+    this.vitality=Math.max(0,Math.min(1,this.vitality+0.04));
+    this.overload*=0.88;
+    this.resonance=Math.max(-1,Math.min(1,this.resonance+0.03));
+    this.plasticityMass*=0.35;
+    this.consolidations++;
+    return true;
   }
 }
 
 class Parliament {
   constructor(d,nInit=4){
-    this.d=d;this.experts=[];this.n=nInit;
+    this.d=d;this.experts=[];this.n=nInit;this.lastK=0;this.lastEntropy=0;this.lastDiversity=0;this.lastWinners=[];this.lastBirths=0;this.lastDeaths=0;this.lastConsolidations=0;
     for(let i=0;i<nInit;i++)this.experts.push(new Expert(d,DOE_RANK));
   }
   avgVitality(){if(!this.n)return 0;let s=0;for(let i=0;i<this.n;i++)s+=this.experts[i].vitality;return s/this.n;}
@@ -765,20 +1038,54 @@ class Parliament {
       const o=this.experts[i].forward(x);outs.push(o);
       let dot=0;for(let d=0;d<this.d;d++)dot+=o[d]*x[d];votes.push(dot);
     }
-    let mx=votes[0],mn=votes[0];
-    for(let i=1;i<this.n;i++){if(votes[i]>mx)mx=votes[i];if(votes[i]<mn)mn=votes[i];}
-    const cons=(mx-mn)/(Math.abs(mx)+Math.abs(mn)+1e-8);
-    let k=Math.max(1,Math.min(this.n,Math.floor(this.n*(1-cons))));
-    const sel=[...Array(this.n).keys()].sort((a,b)=>votes[b]-votes[a]).slice(0,k);
-    const sv=votes[sel[0]];let exps=[],tot=0;
-    for(const i of sel){const e=Math.exp(votes[i]-sv);exps.push(e);tot+=e;}
-    sel.forEach((idx,si)=>{
+    const sorted=[...Array(this.n).keys()].sort((a,b)=>votes[b]-votes[a]);
+    const sv=votes[sorted[0]];
+    const dist=votes.map(v=>Math.exp(v-sv));
+    const distTot=dist.reduce((a,b)=>a+b,0);
+    let entropy=0;
+    for(const dv of dist){const pr=distTot>0?dv/distTot:1/this.n;if(pr>1e-12)entropy-=pr*Math.log(pr);}
+    entropy/=Math.log(Math.max(2,this.n));
+    let k=1+Math.floor((this.n-1)*Math.max(0,Math.min(1,entropy)));
+    k=Math.max(1,Math.min(this.n,k));
+    this.lastK=k;this.lastEntropy=entropy;
+    const winners=[], picked=new Set();
+    let diversitySum=0;
+    for(let slot=0;slot<k;slot++){
+      let bestIdx=-1,bestScore=-1e30,bestNovelty=0;
+      for(const idx of sorted){
+        if(picked.has(idx))continue;
+        let novelty=1;
+        if(winners.length){
+          let simSum=0;
+          const base=outs[idx];
+          let baseNorm=1e-8; for(let d=0;d<this.d;d++)baseNorm+=base[d]*base[d];
+          baseNorm=Math.sqrt(baseNorm);
+          for(const prev of winners){
+            let dot=0,otherNorm=1e-8;
+            for(let d=0;d<this.d;d++){dot+=base[d]*outs[prev][d];otherNorm+=outs[prev][d]*outs[prev][d];}
+            simSum+=Math.max(0,dot/(baseNorm*Math.sqrt(otherNorm)));
+          }
+          novelty=Math.max(0,Math.min(1,1-simSum/winners.length));
+        }
+        const score=votes[idx]+0.08*novelty-0.06*this.experts[idx].overload-0.03*Math.max(0,Math.min(1,this.experts[idx].resonance));
+        if(score>bestScore){bestScore=score;bestIdx=idx;bestNovelty=novelty;}
+      }
+      if(bestIdx<0)break;
+      winners.push(bestIdx);picked.add(bestIdx);diversitySum+=bestNovelty;
+    }
+    this.lastWinners=winners.slice();
+    this.lastDiversity=winners.length?diversitySum/winners.length:0;
+    let exps=[],tot=0;
+    for(const i of winners){const e=Math.exp(votes[i]-sv);exps.push(e);tot+=e;}
+    winners.forEach((idx,si)=>{
       const w=exps[si]/tot;
       for(let d=0;d<this.d;d++)result[d]+=w*outs[idx][d];
-      this.experts[idx].vitality=0.9*this.experts[idx].vitality+0.1*Math.abs(w);
+      this.experts[idx].vitality=0.86*this.experts[idx].vitality+0.14*Math.abs(w);
+      this.experts[idx].resonance=0.88*this.experts[idx].resonance+0.12*votes[idx];
+      this.experts[idx].overload=Math.max(0,Math.min(1,0.90*this.experts[idx].overload+0.20*Math.max(0,w-0.30)));
+      this.experts[idx].lowSteps=0;
     });
-    const selSet=new Set(sel);
-    for(let i=0;i<this.n;i++)if(!selSet.has(i)){this.experts[i].vitality*=0.95;this.experts[i].lowSteps++;}
+    for(let i=0;i<this.n;i++)if(!picked.has(i)){const recovery=0.015+0.03*(1-this.experts[i].overload);this.experts[i].vitality=Math.max(0,Math.min(1,0.96*this.experts[i].vitality+recovery*Math.max(0,Math.min(1,Math.abs(this.experts[i].resonance)))));this.experts[i].overload*=0.92;this.experts[i].lowSteps++;}
     return result;
   }
   inject(logits,x,V){
@@ -787,19 +1094,23 @@ class Parliament {
     for(let i=0;i<n;i++)logits[i]+=DOE_ALPHA*delta[i];
   }
   notorch(x,debt){
-    for(let i=0;i<this.n;i++){this.experts[i].hebbian(x,debt);this.experts[i].age++;}
+    this.lastConsolidations=0;
+    for(let i=0;i<this.n;i++){this.experts[i].hebbian(x,debt);if(this.experts[i].plasticityMass>0.002&&this.experts[i].consolidate())this.lastConsolidations++;this.experts[i].age++;}
   }
   lifecycle(){
-    this.experts=this.experts.filter(e=>!(e.lowSteps>=8&&e.vitality<0.1&&this.experts.length>2));
+    const before=this.experts.length;
+    this.experts=this.experts.filter(e=>!(e.lowSteps>=12&&e.vitality<0.06&&Math.abs(e.resonance)<0.05&&e.age>28&&this.experts.length>2));
+    this.lastDeaths=Math.max(0,before-this.experts.length);
     const births=[];
     for(const e of this.experts){
-      if(e.vitality>0.8&&e.age>50&&this.experts.length+births.length<MAX_EXPERTS){
+      if(e.vitality>0.70&&e.age>40&&e.overload>0.32&&this.experts.length+births.length<MAX_EXPERTS){
         const c=new Expert(e.d,e.rank);
         for(let j=0;j<c.rank*c.d;j++)c.A[j]=e.A[j]+0.005*(Math.random()-0.5);
         for(let j=0;j<c.d*c.rank;j++)c.B[j]=e.B[j]+0.005*(Math.random()-0.5);
-        c.vitality=0.5;births.push(c);e.vitality*=0.6;
+        c.vitality=0.5;c.overload=0.18;c.resonance=0.5*e.resonance;births.push(c);e.vitality*=0.62;e.overload*=0.5;
       }
     }
+    this.lastBirths=births.length;
     this.experts.push(...births);
     this.n=this.experts.length;
   }
@@ -831,7 +1142,10 @@ function saveBrowserMemory(){
     data.periodic=[...periodic.elements.entries()].map(([w,e])=>({w,ch:e.ch,mass:e.mass}));
   }
   if(chambers){
-    data.chambers={soma:[...chambers.soma],presence:chambers.presence,debt:chambers.debt,trauma:chambers.trauma};
+    data.chambers={soma:[...chambers.soma],presence:chambers.presence,debt:chambers.debt,trauma:chambers.trauma,scar:chambers.scar,coherence:chambers.coherence,phaseLock:chambers.phaseLock,thresholdBias:chambers.thresholdBias};
+  }
+  if(parliament){
+    data.parliament={lastK:parliament.lastK,lastEntropy:parliament.lastEntropy,lastDiversity:parliament.lastDiversity,lastWinners:[...parliament.lastWinners],lastBirths:parliament.lastBirths||0,lastDeaths:parliament.lastDeaths||0,lastConsolidations:parliament.lastConsolidations||0};
   }
   localStorage.setItem('q.memory',JSON.stringify(data));
 }
@@ -863,6 +1177,19 @@ function loadBrowserMemory(){
       chambers.presence=Math.max(0,Math.min(1,Number(mem.chambers.presence)||0));
       chambers.debt=Math.max(0,Math.min(1,Number(mem.chambers.debt)||0));
       chambers.trauma=Math.max(0,Math.min(1,Number(mem.chambers.trauma)||0));
+      chambers.scar=Math.max(0,Math.min(1,Number(mem.chambers.scar)||0));
+      chambers.coherence=Math.max(0,Math.min(1,Number(mem.chambers.coherence)||0));
+      chambers.phaseLock=Math.max(0,Math.min(1,Number(mem.chambers.phaseLock)||0));
+      chambers.thresholdBias=Math.max(0,Math.min(1,Number(mem.chambers.thresholdBias)||0));
+    }
+    if(mem.parliament&&parliament){
+      parliament.lastK=Number(mem.parliament.lastK)||0;
+      parliament.lastEntropy=Number(mem.parliament.lastEntropy)||0;
+      parliament.lastDiversity=Number(mem.parliament.lastDiversity)||0;
+      parliament.lastWinners=Array.isArray(mem.parliament.lastWinners)?mem.parliament.lastWinners.slice(0,MAX_EXPERTS):[];
+      parliament.lastBirths=Number(mem.parliament.lastBirths)||0;
+      parliament.lastDeaths=Number(mem.parliament.lastDeaths)||0;
+      parliament.lastConsolidations=Number(mem.parliament.lastConsolidations)||0;
     }
     return true;
   }catch(_err){return false;}
@@ -907,16 +1234,54 @@ function coherenceScore(ids){
   const triNorm=ids.length>2?triSum/(ids.length-2):0;
   return biSum/(ids.length-1)+0.5*hbSum/(ids.length-1)+0.8*triNorm+lenBonus;
 }
+function surfaceCoherenceScore(ids){
+  if(!ids.length)return-1;
+  let score=bpe.surfaceTransitionAdjust(-1,ids[0],0);
+  if(bpe.isCleanSeedToken(ids[0]))score+=0.18;
+  const limit=Math.min(ids.length,12);
+  for(let i=1;i<limit;i++)score+=bpe.surfaceTransitionAdjust(ids[i-1],ids[i],1);
+  return score;
+}
+function metaweightsFieldScale(step){return Math.max(0.55,Math.min(1.0,0.55+0.045*step));}
+function promptFocusScale(hasTf,plen,step){
+  if(hasTf||plen<=1)return 1.0;
+  if(step<=4)return 0.62;
+  if(step<=8)return 0.82;
+  return 1.0;
+}
+function anchoredPromptFromInput(text,maxTokens=4){
+  const inpIds=bpe.encode(text);
+  if(!inpIds.length)return null;
+  let start=0;
+  if(!bpe.isCleanSeedToken(inpIds[start])){
+    let found=false;
+    for(let i=1;i<inpIds.length;i++)if(bpe.startsWithSpace(inpIds[i])&&bpe.isCleanSeedToken(inpIds[i])){start=i;found=true;break;}
+    if(!found)for(let i=1;i<inpIds.length;i++)if(bpe.startsWithSpace(inpIds[i])){start=i;break;}
+  }
+  return inpIds.slice(start,Math.min(inpIds.length,start+maxTokens));
+}
+function earlySentenceQuality(ids){
+  if(!ids.length)return-1;
+  let score=surfaceCoherenceScore(ids);
+  if(ids.length<8)score-=0.4;
+  if(!bpe.isCleanSeedToken(ids[0]))score-=0.6;
+  const text=bpe.decode(ids.slice(0,10)).replace(/^\s+/,'');
+  if(text.length>=2&&text[0]>='a'&&text[0]<='z')score-=0.4;
+  if(text.includes('...'))score-=0.2;
+  return score;
+}
 
 // zero token embedding table for MetaWeights-only mode (matches C zero-weight fallback)
 let _zeroTokCache=null;
 function _zeroTok(V,D){if(!_zeroTokCache||_zeroTokCache.length!==V*D)_zeroTokCache=new Float32Array(V*D);return _zeroTokCache;}
 
-function genSentence(prompt,temp,gdest){
+function genSentence(prompt,temp,gdest,velocity){
   const V=tf&&tf.loaded?tf.V:bpe.vocabSize;
   const D=tf&&tf.loaded?tf.D:48;
   if(tf&&tf.loaded)tf.reset();
   const destiny=new Float32Array(D);
+  const promptAnchor=new Float32Array(D);
+  let promptAnchorNorm=0;
   if(gdest)for(let d=0;d<D;d++)destiny[d]=0.3*gdest[d];
   const prevLogits=new Float32Array(V);
   let prevChosen=-1;
@@ -928,6 +1293,14 @@ function genSentence(prompt,temp,gdest){
   // feed prompt through transformer
   if(tf&&tf.loaded){
     for(let i=0;i<prompt.length&&i<(tf.CTX-1);i++)tf.forward(prompt[i],i);
+  }
+  for(let i=0;i<prompt.length;i++){
+    if(prompt[i]>=0&&prompt[i]<V)for(let d=0;d<D;d++)promptAnchor[d]+=tokEmb[prompt[i]*D+d];
+  }
+  if(prompt.length){
+    for(let d=0;d<D;d++)promptAnchor[d]/=prompt.length;
+    for(let d=0;d<D;d++)promptAnchorNorm+=promptAnchor[d]*promptAnchor[d];
+    promptAnchorNorm=Math.sqrt(promptAnchorNorm+1e-10);
   }
 
   for(let step=0;step<120&&out.length<256;step++){
@@ -973,14 +1346,45 @@ function genSentence(prompt,temp,gdest){
     const hs=Math.max(0,ctx.length-8);
     const heb=mw.queryHebb(ctx.slice(hs),V);
     const pro=mw.queryProphecy(ctx,V);
+    const pDebt=mw.prophecyPressure();
 
     // trauma
     if(chambers&&chambers.trauma>0.1)for(let i=0;i<V;i++)raw[i]/=(1+chambers.trauma);
+    if(chambers&&chambers.scar>0.05){
+      for(let i=0;i<V;i++)raw[i]*=(1-0.08*chambers.scar);
+      for(const [word,ch] of Object.entries(ANCHORS))if(ch===3){
+        const tok=bpe.findToken(word);
+        if(tok>=0&&tok<V)raw[tok]+=0.12*chambers.scar;
+      }
+    }
 
     // detect transformer activity
     let tmag=0;for(let i=0;i<V;i++)tmag+=Math.abs(raw[i]);tmag/=V;
     const hasTf=tmag>0.1;
-    const cHeb=(hasTf?0.6:1.0)*mod.a,cPro=(hasTf?0.4:0.7)*mod.b,cDs=(hasTf?0.3:0.15)*mod.g,cBg=hasTf?5:15,cTg=hasTf?3:10;
+    let cHeb=(hasTf?0.6:1.0)*mod.a,cPro=(hasTf?0.4:0.7)*mod.b,cDs=(hasTf?0.3:0.15)*mod.g,cBg=hasTf?5:15,cTg=hasTf?3:10;
+    if(velocity){
+      cHeb*=velocity.hebMul;
+      cPro*=velocity.proMul*(1+0.35*pDebt);
+      cDs*=velocity.dsMul*(1-0.20*velocity.darkPressure);
+      cBg*=velocity.bgMul;
+      cTg*=velocity.tgMul;
+    }
+    let cDoc=hasTf?0.18:0.32;
+    if(!hasTf){
+      const mwScale=metaweightsFieldScale(step);
+      cPro*=mwScale;
+      cBg*=mwScale;
+      cTg*=mwScale;
+      cDoc*=mwScale;
+    }
+    {
+      const focus=promptFocusScale(hasTf,prompt.length,step);
+      cPro*=focus;
+      cBg*=focus;
+      cTg*=focus;
+      cDoc*=focus;
+      var cPrompt=(hasTf&&promptAnchorNorm>1e-8&&step<6)?((step<2?0.14:0.09)*focus):0;
+    }
 
     for(let i=0;i<V;i++){
       const bg=mw.queryBi(ctx[ctx.length-1],i);
@@ -992,6 +1396,15 @@ function genSentence(prompt,temp,gdest){
         if(en>1e-8){let dot=0;for(let d=0;d<D;d++)dot+=destiny[d]*tokEmb[i*D+d];ds=dot/(dn*en);}
       }
       raw[i]+=cHeb*heb[i]+cPro*pro[i]+cDs*ds+cBg*bg+cTg*tg;
+      if(velocity&&velocity.docSignal)raw[i]+=cDoc*velocity.docSignal[i];
+      if(cPrompt>0){
+        let en=0;for(let d=0;d<D;d++)en+=tokEmb[i*D+d]*tokEmb[i*D+d];
+        en=Math.sqrt(en+1e-10);
+        if(en>1e-8){
+          let dot=0;for(let d=0;d<D;d++)dot+=promptAnchor[d]*tokEmb[i*D+d];
+          raw[i]+=cPrompt*(dot/(promptAnchorNorm*en));
+        }
+      }
       if(mw.unigram[i]<1e-6)raw[i]-=2;
       else if(mw.unigram[i]>0.01)raw[i]-=0.3*(mw.unigram[i]-0.01)*100;
     }
@@ -1004,18 +1417,29 @@ function genSentence(prompt,temp,gdest){
       for(let ri=0;ri<ctx.length-1;ri++)
         if(ctx[ri]===ctx[ctx.length-2]&&ctx[ri+1]<V)raw[ctx[ri+1]]*=0.2;
     }
+    {
+      const prevTok=ctx.length?ctx[ctx.length-1]:-1;
+      for(let i=0;i<V;i++)raw[i]+=bpe.surfaceTransitionAdjust(prevTok,i,step);
+    }
 
     // hybrid decode
     let ch;
     if(!hasTf){
-      if(step<6){ch=0;let mx=raw[0];for(let i=1;i<V;i++)if(raw[i]>mx){mx=raw[i];ch=i;}}
-      else ch=sampleNucleus(raw,V,0.5,0.7);
-    }else if(step<4){
+      if(step<10){ch=0;let mx=raw[0];for(let i=1;i<V;i++)if(raw[i]>mx){mx=raw[i];ch=i;}}
+      else ch=sampleNucleus(raw,V,0.35,0.55);
+    }else if(step<2){
       ch=0;let mx=raw[0];for(let i=1;i<V;i++)if(raw[i]>mx){mx=raw[i];ch=i;}
-    }else ch=sampleNucleus(raw,V,Math.max(0.3,Math.min(1.2,temp*mod.t)),0.85);
+    }else if(step<5){
+      const velTemp=velocity?velocity.tempMul:1;
+      ch=sampleNucleus(raw,V,Math.max(0.22,Math.min(0.55,temp*mod.t*velTemp*0.72)),0.60);
+    }else{
+      const velTemp=velocity?velocity.tempMul:1;
+      ch=sampleNucleus(raw,V,Math.max(0.25,Math.min(1.35,temp*mod.t*velTemp)),0.85);
+    }
 
     prevChosen=ch;
     out.push(ch);ctx.push(ch);
+    mw.prophecyUpdate(ch);
     // word capture: bigram + Hebbian (matches C online capture)
     if(ctx.length>=2){
       mw.captureOnline(ctx[ctx.length-2],ch);
@@ -1027,6 +1451,21 @@ function genSentence(prompt,temp,gdest){
         const k=a*65536+b;
         mw.hebb.set(k,(mw.hebb.get(k)||0)+decay*0.005);
       }
+      const prev=ctx[ctx.length-2],cur=ch;
+      let bestPred=-1,bestProb=0;
+      for(const [k,p] of mw.tri){
+        const parts=k.split(',');
+        if(parts.length!==3)continue;
+        const a=Number(parts[0]),b=Number(parts[1]),c2=Number(parts[2]);
+        if(a===prev&&b===cur&&p>bestProb){bestProb=p;bestPred=c2;}
+      }
+      if(bestPred<0){
+        for(const [k,p] of mw.bi){
+          const a=k>>>16,b=k&0xffff;
+          if(a===cur&&p>bestProb){bestProb=p;bestPred=b;}
+        }
+      }
+      if(bestPred>=0)mw.prophecyAdd(bestPred,0.2+0.5*bestProb);
     }
     if(bpe.isBoundary(ch)&&step>8)break;
   }
@@ -1105,12 +1544,18 @@ function generateChain(inputText){
     ingestIds(uids,0.02);
     if(uids.length>1)log(`[ingested ${uids.length} tokens: +bi +tri +hebb]`,'sys');
     chambers.feel(inputText,periodic);
+    chambers.absorbDarkMatter(inputText,periodic);
     chambers.act[4]=Math.min(1,chambers.act[4]+0.1);
     chambers.crossfire(8);
   }
+  const velocity=velocityProfile(chambers,cd);
+  chambers.debt=Math.max(0,Math.min(1,(0.88*chambers.debt+0.12*mw.prophecyPressure())*velocity.debtDecay));
+  chambers.trauma=Math.max(0,Math.min(1,chambers.trauma*velocity.traumaDecay));
+  chambers.scar=Math.max(0,Math.min(1,chambers.scar*velocity.scarDecay));
+  let phaseGate=softPhaseGate(chambers,coherenceEnvPressure(chambers,cd,mw.prophecyPressure(),0));
 
   const modeStr=tf&&tf.loaded?'TRAINED':'METAWEIGHTS ONLY';
-  log(`diss=${cd.toFixed(3)} debt=${chambers.debt.toFixed(3)} emrg=${chambers.emergence().toFixed(3)} [${modeStr}]`);
+  log(`diss=${cd.toFixed(3)} debt=${chambers.debt.toFixed(3)} scar=${chambers.scar.toFixed(3)} gate=${phaseGate.toFixed(3)} emrg=${chambers.emergence().toFixed(3)} vel=${velocity.name} [${modeStr}]`);
   log(`chambers: ${chambers.summary()}`,'sys');
   if(interference&&interference.docs.length)log(`interference: ${interference.docs.length} docs loaded`,'sys');
   updateStats();
@@ -1123,18 +1568,23 @@ function generateChain(inputText){
   function isSentStart(r){return r+5<=corpusIds.length&&bpe.isBoundary(corpusIds[r])&&bpe.startsWithSpace(corpusIds[r+1]);}
 
   for(let si=0;si<CHAIN;si++){
+    janusPhasePressure(chambers,si,CHAIN);
     let dir=si<nb?-1:si===nb?0:1;
-    let prompt=null,usedInterf=false;
-    if(interference&&interference.docs.length&&Math.random()<0.3){
-      const seed=interference.injectSeed(chambers,bpe,periodic);
-      if(seed!==null){prompt=[seed];usedInterf=true;}
+    const activeDoc=interference&&interference.docs.length?interference.chooseDoc(inputText,chambers,periodic,mw,bpe):null;
+    const activeChunk=activeDoc?interference.chooseChunk(activeDoc,inputText,chambers,periodic,mw,bpe):null;
+    velocity.docSignal=activeChunk?interferenceSignal(activeChunk,V):null;
+    if(activeChunk&&activeChunk.heavy.length){
+      const cleanHeavy=activeChunk.heavy.filter(tid=>bpe.isCleanSeedToken(tid));
+      const seedTok=(cleanHeavy.length?cleanHeavy:activeChunk.heavy)[0];
+      if(seedTok>=0&&seedTok<V)for(let d=0;d<D;d++)gdest[d]=0.97*gdest[d]+0.03*tokEmb[seedTok*D+d];
     }
-    if(!prompt&&inputText){
-      const inpIds=bpe.encode(inputText);
-      if(inpIds.length){
-        const st=Math.floor(Math.random()*Math.max(1,inpIds.length-1));
-        prompt=inpIds.slice(st,Math.min(st+2,inpIds.length));
-      }
+    let prompt=null,usedInterf=false;
+    if(inputText){
+      prompt=anchoredPromptFromInput(inputText,4);
+    }
+    if(!prompt&&interference&&interference.docs.length&&Math.random()<Math.max(0.05,Math.min(0.5,0.3+velocity.interfBonus))){
+      const seed=activeChunk?interference.injectSeedFromDoc(activeChunk,chambers,bpe,periodic):(activeDoc?interference.injectSeedFromDoc(activeDoc,chambers,bpe,periodic):interference.injectSeed(chambers,bpe,periodic));
+      if(seed!==null){prompt=[seed];usedInterf=true;}
     }
 
     let start=-1;
@@ -1169,36 +1619,46 @@ function generateChain(inputText){
     const tSec=si/CHAIN;
     const schumann=0.4*Math.sin(2*Math.PI*7.83*tSec)+0.2*Math.sin(2*Math.PI*14.3*tSec)+0.1*Math.sin(2*Math.PI*20.8*tSec)+0.05*Math.sin(2*Math.PI*27.3*tSec);
     const baseTemp=tf&&tf.loaded?0.6:0.75;
-    const temp=Math.max(0.4,Math.min(0.85,baseTemp+0.08*schumann));
+    const temp=Math.max(0.35,Math.min(0.95,(baseTemp+0.08*schumann)*velocity.tempMul));
 
     // best of 3
     let bestOut=null,bestSc=-Infinity;
+    let bestQ=-Infinity;
     const gdestSave=new Float32Array(gdest);
-    for(let cand=0;cand<3;cand++){
+    const candTrials=!tf.loaded&&si<=1?5:3;
+    for(let cand=0;cand<candTrials;cand++){
       if(cand>0)gdest.set(gdestSave);
-      const o=genSentence(prompt,temp,gdest);
-      const sc=coherenceScore(o);
+      let candTemp=temp;
+      if(!tf.loaded&&si<=1&&cand>0)candTemp=Math.max(0.28,Math.min(temp,temp*(0.92-0.06*Math.min(cand,3))));
+      const o=genSentence(prompt,candTemp,gdest,velocity);
+      const sc=coherenceScore(o)+0.6*surfaceCoherenceScore(o);
+      const qSc=!tf.loaded&&si<=1?earlySentenceQuality(o):sc;
+      if(qSc>bestQ)bestQ=qSc;
       if(sc>bestSc){bestSc=sc;bestOut=o;}
-      if(bestSc>1&&bestOut.length>12)break;
+      if(bestQ>0.1&&bestSc>1&&bestOut.length>12)break;
     }
 
     let wormhole=false;
     if(si<CHAIN-1){
       let whProb=0.02;
       if(cd>0.3)whProb+=((cd-0.3)/0.7)*0.15;
-      wormhole=Math.random()<whProb;
+      whProb=Math.max(0,Math.min(0.3,whProb+velocity.wormholeBonus));
+      const boundaryOk=bestOut.length>10&&bestSc>(0.22+0.18*phaseGate);
+      wormhole=boundaryOk&&(Math.random()<whProb);
       if(wormhole&&interference&&interference.docs.length){
         const farthest=[...interference.docs].sort((a,b)=>b.heavy.length-a.heavy.length)[0];
         if(farthest&&farthest.heavy.length){
           dir=dir!==0?-dir:1;
-          const whPrompt=[farthest.heavy[Math.floor(Math.random()*farthest.heavy.length)]];
-          bestOut=genSentence(whPrompt,tf&&tf.loaded?0.55:0.7,gdest);
-          bestSc=coherenceScore(bestOut);
+          const whPrompt=[...bestOut.slice(Math.max(0,bestOut.length-3)),farthest.heavy[Math.floor(Math.random()*farthest.heavy.length)]];
+          bestOut=genSentence(whPrompt,tf&&tf.loaded?0.55:0.7,gdest,velocity);
+          bestSc=coherenceScore(bestOut)+0.6*surfaceCoherenceScore(bestOut);
+          if(bestSc<0.15)chambers.debt=Math.max(0,Math.min(1,chambers.debt+0.04));
+          else chambers.debt=Math.max(0,Math.min(1,chambers.debt*0.97));
         }
       }
     }
 
-    const text=bpe.decode(bestOut);
+    const text=bpe.decode(bestOut.slice(bpe.displayStartIndex(bestOut))).replace(/^\s+/,'');
     chainIds.push(bestOut);chainLens.push(bestOut.length);
     if(bestOut.length<5||(bestSc<0.01&&bestOut.length<8)){
       addStep(si+1,dir,'[...]');
@@ -1206,6 +1666,9 @@ function generateChain(inputText){
       addStep(si+1,dir,text+(usedInterf?' {interf}':'')+(wormhole?' {wormhole}':''));
       chambers.feel(text,periodic);
       ingestIds(bpe.encode(text),0.005);
+      const localPhase=Math.max(0,Math.min(1,0.50+0.25*bestSc+0.04*surfaceCoherenceScore(bestOut)));
+      const chunkRes=activeChunk?activeChunk.heavy.length/16:0;
+      phaseGate=updatePhaseState(chambers,localPhase,coherenceEnvPressure(chambers,cd,mw.prophecyPressure(),chunkRes));
     }
     chambers.crossfire(3);
     chambers.debt=0.9*chambers.debt+0.05;
@@ -1218,16 +1681,17 @@ function generateChain(inputText){
     let minSc=spaScores[0],weakIdx=0;
     for(let i=1;i<CHAIN;i++)if(spaScores[i]<minSc){minSc=spaScores[i];weakIdx=i;}
     let avgSc=0;for(let i=0;i<CHAIN;i++)avgSc+=spaScores[i];avgSc/=CHAIN;
-    if(minSc<avgSc*0.6){ // slightly more aggressive threshold
+    const reseedFloor=avgSc*(0.52+0.18*(1-phaseGate));
+    if(minSc<reseedFloor){
       log(`[SPA-${spaPass+1}] reseeding step ${weakIdx+1} (score=${minSc.toFixed(2)}, avg=${avgSc.toFixed(2)})`);
       // use neighbor sentences as context for better continuity
       const seedSrc=weakIdx>0?weakIdx-1:(weakIdx<CHAIN-1?weakIdx+1:0);
       const nprom=Math.min(3,chainIds[seedSrc].length);
       const rPrompt=chainIds[seedSrc].slice(chainIds[seedSrc].length-nprom);
       const rTemp=tf&&tf.loaded?0.55:0.7;
-      const rOut=genSentence(rPrompt,rTemp,gdest);
-      const newSc=coherenceScore(rOut);
-      const oldSc=coherenceScore(chainIds[weakIdx]);
+      const rOut=genSentence(rPrompt,rTemp,gdest,velocity);
+      const newSc=coherenceScore(rOut)+0.6*surfaceCoherenceScore(rOut);
+      const oldSc=coherenceScore(chainIds[weakIdx])+0.6*surfaceCoherenceScore(chainIds[weakIdx]);
       if(newSc>oldSc*0.7||rOut.length>chainIds[weakIdx].length){ // accept if reasonable
         chainIds[weakIdx]=rOut;chainLens[weakIdx]=rOut.length;
         const rText=bpe.decode(rOut);
@@ -1235,6 +1699,7 @@ function generateChain(inputText){
         addStep(weakIdx+1,dir,rText+' {reseeded}');
         chambers.feel(rText,periodic);
         ingestIds(rOut,0.003);
+        phaseGate=updatePhaseState(chambers,Math.max(0,Math.min(1,0.48+0.22*newSc)),coherenceEnvPressure(chambers,cd,mw.prophecyPressure(),0));
       }
     }else break; // no weak sentences, stop iterating
   }
@@ -1296,6 +1761,19 @@ async function initCorpus(text){
   $('#btn-gen').disabled=false;$('#prompt').disabled=false;$('#btn-send').disabled=false;
 }
 
+async function autoBootFromQuery(){
+  const qp=new URLSearchParams(window.location.search);
+  if(qp.get('demo')!=='1')return;
+  await initCorpus(DEMO);
+  const prompt=qp.get('prompt');
+  if(prompt){
+    setTimeout(()=>{
+      $('#prompt').value=prompt;
+      $('#btn-gen').click();
+    },200);
+  }
+}
+
 $('#btn-demo').onclick=()=>initCorpus(DEMO);
 $('#btn-gen').onclick=()=>{const v=$('#prompt').value.trim();$('#prompt').value='';if(v)log(`\nq> ${v}`,'sys');generateChain(v||null);};
 $('#btn-send').onclick=$('#btn-gen').onclick;
@@ -1317,6 +1795,8 @@ document.body.ondrop=e=>{
     else if(f.name.endsWith('.merges')){const r=new FileReader();r.onload=()=>{bpe=new BPE();bpe.loadBinary(r.result);log(`Merges loaded: ${bpe.merges.length}`,'sys');};r.readAsArrayBuffer(f);}
   }
 };
+
+autoBootFromQuery();
 </script>
 </body>
 </html>

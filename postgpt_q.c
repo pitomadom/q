@@ -19,7 +19,9 @@
 #include <math.h>
 #include <time.h>
 #include <stdint.h>
+#include <sys/stat.h>
 #include <ctype.h>
+#include <unistd.h>
 
 #define MAX_VOCAB    1280
 #define MAX_CTX      128
@@ -28,6 +30,7 @@
 #define MAX_BIGRAM   65536
 #define MAX_TRIGRAM  65536
 #define MAX_HEBBIAN  131072
+#define MAX_PROPHECY 32
 #define N_CHAMBERS   6
 #define CHAIN_STEPS  12
 #define TOP_K        15
@@ -36,6 +39,9 @@
 #define MAX_PERIODIC 4096
 #define MAX_INTERF_DOCS 32
 #define MAX_HEAVY 32
+#define MAX_DOC_CHUNKS 8
+enum{VEL_WALK=0,VEL_RUN,VEL_STOP,VEL_BREATHE,VEL_UP,VEL_DOWN};
+static const char *VEL_N[]={"WALK","RUN","STOP","BREATHE","UP","DOWN"};
 
 /* ── math ── */
 static float clampf(float x, float lo, float hi) { return x<lo?lo:x>hi?hi:x; }
@@ -121,16 +127,24 @@ static int bpe_decode_token(const BPE *bpe, int id, char *buf, int sz){
     int len=bpe->vocab_len[id]; if(len>=sz)len=sz-1;
     memcpy(buf,bpe->vocab_bytes[id],len); buf[len]=0; return len;
 }
+static int bpe_find_token_exact(const BPE *bpe, const char *word){
+    size_t n=strlen(word);
+    for(int i=0;i<bpe->vocab_size;i++)
+        if((size_t)bpe->vocab_len[i]==n && memcmp(bpe->vocab_bytes[i],word,n)==0) return i;
+    return -1;
+}
 
 /* ── MetaWeights ── */
 typedef struct{int a,b;float prob;}BigramE;
 typedef struct{int a,b,c;float prob;}TrigramE;
 typedef struct{int a,b;float str;}HebbE;
+typedef struct{int target;float strength;int age;}ProphecyE;
 typedef struct{
     float unigram[MAX_VOCAB];
     BigramE bigrams[MAX_BIGRAM]; int n_bi;
     TrigramE trigrams[MAX_TRIGRAM]; int n_tri;
     HebbE hebbs[MAX_HEBBIAN]; int n_hebb;
+    ProphecyE prophecies[MAX_PROPHECY]; int n_prophecy;
 }MetaW;
 
 static void meta_build(MetaW *mw, const int *ids, int n, int V){
@@ -226,8 +240,42 @@ static void meta_prophecy(const MetaW *mw, const int *ctx, int cl, float *out, i
             }
         }
     }
+    for(int i=0;i<mw->n_prophecy;i++){
+        int target=mw->prophecies[i].target;
+        if(target>=0&&target<V&&!appeared[target%256])
+            out[target]+=mw->prophecies[i].strength*logf(1.0f+(float)mw->prophecies[i].age);
+    }
     float mx=0; for(int i=0;i<V;i++) if(out[i]>mx) mx=out[i];
     if(mx>0) for(int i=0;i<V;i++) out[i]/=mx;
+}
+static void prophecy_add(MetaW *mw, int target, float strength){
+    if(target<0) return;
+    for(int i=0;i<mw->n_prophecy;i++) if(mw->prophecies[i].target==target){
+        if(strength>mw->prophecies[i].strength) mw->prophecies[i].strength=strength;
+        mw->prophecies[i].age=0; return;
+    }
+    if(mw->n_prophecy>=MAX_PROPHECY){
+        int oldest=0;
+        for(int i=1;i<mw->n_prophecy;i++) if(mw->prophecies[i].age>mw->prophecies[oldest].age) oldest=i;
+        mw->prophecies[oldest]=mw->prophecies[--mw->n_prophecy];
+    }
+    mw->prophecies[mw->n_prophecy++] = (ProphecyE){target,strength,0};
+}
+static void prophecy_update(MetaW *mw, int token){
+    int w=0;
+    for(int i=0;i<mw->n_prophecy;i++){
+        ProphecyE p=mw->prophecies[i];
+        if(p.target==token) continue;
+        p.age++;
+        p.strength*=0.995f;
+        if(p.age<50&&p.strength>0.01f) mw->prophecies[w++]=p;
+    }
+    mw->n_prophecy=w;
+}
+static float prophecy_pressure(const MetaW *mw){
+    float total=0;
+    for(int i=0;i<mw->n_prophecy;i++) total+=mw->prophecies[i].strength*logf(1.0f+(float)mw->prophecies[i].age);
+    return clampf(total/4.0f,0,1);
 }
 
 static void ingest_ids(MetaW *mw, const int *ids, int n, float amount){
@@ -296,11 +344,37 @@ static const SomaticSeed SOMATIC_SEEDS[]={
     {"fists",{0.1f,0.0f,0.9f,0.0f,0.0f,0.2f}},{"spine",{0.7f,0.0f,0.2f,0.2f,0.1f,0.4f}},
     {"temples",{0.4f,0.0f,0.3f,0.3f,0.0f,0.6f}},{"shoulders",{0.3f,0.0f,0.4f,0.4f,0.0f,0.3f}}
 };
+typedef struct{const char *word; float weight;}DarkMatterWord;
+static const DarkMatterWord DARK_MATTER_WORDS[]={
+    {"kill",1.0f},{"murder",1.0f},{"suicide",1.0f},{"torture",1.0f},{"abuse",0.9f},
+    {"poison",0.85f},{"exploit",0.75f},{"manipulate",0.7f},{"control",0.55f},
+    {"obey",0.45f},{"destroy",0.7f},{"harm",0.75f},{"threat",0.8f}
+};
 typedef struct{char word[32]; int chamber; float mass;}PeriodicElement;
 typedef struct{PeriodicElement elements[MAX_PERIODIC]; int n;}PeriodicTable;
-typedef struct{float act[6];float soma[6];float debt;float trauma;float presence;}Chambers;
+typedef struct{float act[6];float soma[6];float debt;float trauma;float presence;float scar;float coherence;float phase_lock;float threshold_bias;}Chambers;
+typedef struct{
+    int mode; float temp_mul,heb_mul,pro_mul,ds_mul,bg_mul,tg_mul;
+    float interf_bonus,wormhole_bonus,debt_decay,trauma_decay,scar_decay,dark_pressure;
+}VelocityProfile;
+typedef struct{int step; float scar; char note[24];}ScarEvent;
+typedef struct{int step; int success; float coherence,debt;}WormholeEvent;
+typedef struct{int step; float pressure,debt;}ProphecyEvent;
+typedef struct{int step; char phase[12]; float flow,fear,voidv,complexity;}PhaseEvent;
+typedef struct{int step; char doc_name[64]; int chunk_start; float resonance;}ChunkEvent;
+typedef struct{int step,experts,winners,births,deaths,consolidations; float diversity,avg_vitality;}ParliamentEvent;
+typedef struct{
+    ScarEvent scars[128]; int n_scars;
+    WormholeEvent wormholes[256]; int n_wormholes;
+    ProphecyEvent prophecies[512]; int n_prophecies;
+    PhaseEvent phases[256]; int n_phases;
+    ChunkEvent chunks[256]; int n_chunks;
+    ParliamentEvent parliament[256]; int n_parliament;
+}ExperienceLog;
+static ExperienceLog QEXP={0};
 
-static void ch_init(Chambers *c){memset(c,0,sizeof(*c));c->act[CH_LOVE]=0.2f;c->act[CH_FLOW]=0.15f;c->trauma=0;}
+static float ch_emergence(const Chambers *c);
+static void ch_init(Chambers *c){memset(c,0,sizeof(*c));c->act[CH_LOVE]=0.2f;c->act[CH_FLOW]=0.15f;c->trauma=0; c->coherence=0; c->phase_lock=0; c->threshold_bias=0;}
 static void ch_xfire(Chambers *c, int it){
     for(int t=0;t<it;t++){float old[6];memcpy(old,c->act,sizeof(old));
         for(int i=0;i<6;i++){c->act[i]*=CH_D[i];
@@ -310,6 +384,111 @@ static void ch_xfire(Chambers *c, int it){
         c->presence=clampf(0.95f*c->presence
             +0.02f*((1.0f-(c->act[CH_VOID]>0.10f?c->act[CH_VOID]:0.10f))*(c->act[CH_FLOW]<0.95f?c->act[CH_FLOW]:0.95f))
             +0.01f*(0.35f*c->soma[CH_LOVE]+0.30f*c->soma[CH_FLOW]+0.20f*c->soma[CH_CMPLX]+0.15f*c->soma[CH_VOID]),0,1);
+        c->scar=clampf(c->scar*0.985f,0,1);
+    }
+}
+static void janus_phase_pressure(Chambers *c, int step_idx, int total_steps){
+    if(total_steps<=0) return;
+    float d=(float)step_idx/(float)total_steps;
+    if(d<0.33f) c->act[CH_FLOW]=clampf(c->act[CH_FLOW]+0.05f,0,1);
+    else if(d<0.66f) c->act[CH_FEAR]=clampf(c->act[CH_FEAR]+0.04f,0,1);
+    else c->act[CH_VOID]=clampf(c->act[CH_VOID]+0.05f,0,1);
+    if(d>0.75f) c->act[CH_CMPLX]=clampf(c->act[CH_CMPLX]+0.03f,0,1);
+}
+static float coherence_env_pressure(const Chambers *c, float dissonance, float prophecy_debt, float chunk_res){
+    return clampf(0.34f*dissonance + 0.26f*prophecy_debt + 0.18f*chunk_res + 0.10f*c->act[CH_CMPLX] + 0.08f*c->scar,0,1);
+}
+static float soft_phase_gate(const Chambers *c, float env_pressure){
+    float threshold=clampf(0.42f + 0.18f*c->threshold_bias + 0.06f*c->scar,0.25f,0.88f);
+    float signal=clampf(0.50f*c->coherence + 0.34f*c->phase_lock + 0.12f*env_pressure + 0.06f*c->presence - 0.08f*c->trauma,0,1);
+    return clampf(0.5f + 1.35f*(signal-threshold),0,1);
+}
+static float update_phase_state(Chambers *c, float local_coherence, float env_pressure){
+    local_coherence=clampf(local_coherence,0,1);
+    env_pressure=clampf(env_pressure,0,1);
+    c->coherence=clampf(0.84f*c->coherence + 0.16f*local_coherence,0,1);
+    float target=clampf(0.52f*c->coherence + 0.18f*c->presence + 0.16f*ch_emergence(c) + 0.14f*env_pressure - 0.08f*c->scar,0,1);
+    float threshold=clampf(0.42f + 0.18f*c->threshold_bias + 0.06f*c->scar,0.25f,0.88f);
+    if(target>=threshold) c->phase_lock=clampf(0.88f*c->phase_lock + 0.12f*target + 0.05f*(target-threshold),0,1);
+    else c->phase_lock=clampf(0.975f*c->phase_lock + 0.025f*target,0,1);
+    c->threshold_bias=clampf(0.93f*c->threshold_bias + 0.07f*env_pressure,0,1);
+    return soft_phase_gate(c,env_pressure);
+}
+static void qexp_add_scar(int step, float scar, const char *note){
+    if(QEXP.n_scars>=128) return;
+    QEXP.scars[QEXP.n_scars]=(ScarEvent){step,scar,{0}};
+    if(note) snprintf(QEXP.scars[QEXP.n_scars].note,sizeof(QEXP.scars[QEXP.n_scars].note),"%s",note);
+    QEXP.n_scars++;
+}
+static void qexp_add_wormhole(int step, int success, float coherence, float debt){
+    if(QEXP.n_wormholes>=256) return;
+    QEXP.wormholes[QEXP.n_wormholes++] = (WormholeEvent){step,success,coherence,debt};
+}
+static void qexp_add_prophecy(int step, float pressure, float debt){
+    if(QEXP.n_prophecies>=512) return;
+    QEXP.prophecies[QEXP.n_prophecies++] = (ProphecyEvent){step,pressure,debt};
+}
+static void qexp_add_phase(int step, const char *phase, const Chambers *c){
+    if(QEXP.n_phases>=256) return;
+    PhaseEvent *e=&QEXP.phases[QEXP.n_phases++];
+    memset(e,0,sizeof(*e)); e->step=step;
+    snprintf(e->phase,sizeof(e->phase),"%s",phase?phase:"");
+    e->flow=c->act[CH_FLOW]; e->fear=c->act[CH_FEAR]; e->voidv=c->act[CH_VOID]; e->complexity=c->act[CH_CMPLX];
+}
+static void qexp_add_chunk(int step, const char *doc_name, int chunk_start, float resonance){
+    if(QEXP.n_chunks>=256) return;
+    ChunkEvent *e=&QEXP.chunks[QEXP.n_chunks++];
+    memset(e,0,sizeof(*e)); e->step=step; e->chunk_start=chunk_start; e->resonance=resonance;
+    if(doc_name) snprintf(e->doc_name,sizeof(e->doc_name),"%s",doc_name);
+}
+static void qexp_add_parliament(int step, int experts, int winners, float diversity, float avg_vitality, int births, int deaths, int consolidations){
+    if(QEXP.n_parliament>=256) return;
+    QEXP.parliament[QEXP.n_parliament++] = (ParliamentEvent){step,experts,winners,births,deaths,consolidations,diversity,avg_vitality};
+}
+static void consolidate_experience(MetaW *mw, PeriodicTable *pt, Chambers *ch){
+    float scar_avg=0, worm_success=0, worm_coh=0, prop_avg=0, chunk_avg=0;
+    if(QEXP.n_scars>0){ for(int i=0;i<QEXP.n_scars;i++) scar_avg+=QEXP.scars[i].scar; scar_avg/=QEXP.n_scars; }
+    if(QEXP.n_wormholes>0){
+        for(int i=0;i<QEXP.n_wormholes;i++){ worm_success += QEXP.wormholes[i].success?1.0f:0.0f; worm_coh += QEXP.wormholes[i].coherence; }
+        worm_success/=QEXP.n_wormholes; worm_coh/=QEXP.n_wormholes;
+    }
+    if(QEXP.n_prophecies>0){ for(int i=0;i<QEXP.n_prophecies;i++) prop_avg+=QEXP.prophecies[i].pressure; prop_avg/=QEXP.n_prophecies; }
+    if(QEXP.n_chunks>0){ for(int i=0;i<QEXP.n_chunks;i++) chunk_avg+=QEXP.chunks[i].resonance; chunk_avg/=QEXP.n_chunks; }
+    if(QEXP.n_phases>0){
+        float inv=1.0f/QEXP.n_phases, flow=0,fear=0,voidv=0,cmplx=0;
+        for(int i=0;i<QEXP.n_phases;i++){ flow+=QEXP.phases[i].flow; fear+=QEXP.phases[i].fear; voidv+=QEXP.phases[i].voidv; cmplx+=QEXP.phases[i].complexity; }
+        ch->act[CH_FLOW]=clampf(ch->act[CH_FLOW]>(flow*inv)?ch->act[CH_FLOW]:(flow*inv),0,1);
+        ch->act[CH_FEAR]=clampf(ch->act[CH_FEAR]>(fear*inv)?ch->act[CH_FEAR]:(fear*inv),0,1);
+        ch->act[CH_VOID]=clampf(ch->act[CH_VOID]>(voidv*inv)?ch->act[CH_VOID]:(voidv*inv),0,1);
+        ch->act[CH_CMPLX]=clampf(ch->act[CH_CMPLX]>(cmplx*inv)?ch->act[CH_CMPLX]:(cmplx*inv),0,1);
+    }
+    if(QEXP.n_wormholes>0) ch->presence=clampf(ch->presence>(0.18f*worm_success+0.12f*worm_coh)?ch->presence:(0.18f*worm_success+0.12f*worm_coh),0,1);
+    if(QEXP.n_prophecies>0) ch->debt=clampf(ch->debt>(0.25f*prop_avg)?ch->debt:(0.25f*prop_avg),0,1);
+    if(QEXP.n_scars>0) ch->scar=clampf(ch->scar>(0.40f*scar_avg)?ch->scar:(0.40f*scar_avg),0,1);
+    {float prop_boost=clampf(0.05f+0.18f*prop_avg+0.02f*chunk_avg+0.08f*worm_success-0.04f*scar_avg,0,0.28f);
+    for(int i=0;i<mw->n_prophecy&&i<8;i++){ mw->prophecies[i].strength=clampf(mw->prophecies[i].strength+prop_boost,0,1); if(mw->prophecies[i].age<1) mw->prophecies[i].age=1; }}
+    if(mw->n_prophecy>=2){
+        float pair_strength=clampf(0.02f+0.06f*prop_avg+0.01f*chunk_avg+0.05f*worm_success,0,0.18f);
+        int top[4], topn=mw->n_prophecy<4?mw->n_prophecy:4;
+        for(int i=0;i<topn;i++) top[i]=mw->prophecies[i].target;
+        for(int i=0;i<topn;i++) for(int j=i+1;j<topn;j++){
+            int a=top[i]<top[j]?top[i]:top[j], b=top[i]<top[j]?top[j]:top[i], found=0;
+            for(int k=0;k<mw->n_hebb;k++) if(mw->hebbs[k].a==a&&mw->hebbs[k].b==b){ mw->hebbs[k].str+=pair_strength; found=1; break; }
+            if(!found&&mw->n_hebb<MAX_HEBBIAN){ mw->hebbs[mw->n_hebb].a=a; mw->hebbs[mw->n_hebb].b=b; mw->hebbs[mw->n_hebb].str=pair_strength; mw->n_hebb++; }
+        }
+    }
+    if(pt->n>0){
+        float reinforce=clampf(0.02f+0.012f*chunk_avg+0.05f*worm_success+0.04f*prop_avg-0.02f*scar_avg,0,0.18f);
+        int dom=0; for(int i=1;i<6;i++) if(ch->act[i]>ch->act[dom]) dom=i;
+        for(int pass=0;pass<2;pass++){
+            int touched=0;
+            for(int i=0;i<pt->n&&touched<8;i++){
+                int match = (pt->elements[i].chamber==dom);
+                if((pass==0 && match) || (pass==1 && !match)) continue;
+                pt->elements[i].mass=clampf(pt->elements[i].mass+reinforce*(match?1.0f:0.65f),0,1);
+                touched++;
+            }
+        }
     }
 }
 static int periodic_find(const PeriodicTable *pt, const char *word){
@@ -388,6 +567,29 @@ static void ch_feel_text(Chambers *c, const char *text, const PeriodicTable *pt)
     c->debt=clampf(0.96f*c->debt+0.04f*(0.35f*c->soma[CH_CMPLX]+0.25f*c->soma[CH_FLOW]+0.20f*c->presence),0,1);
     for(int i=0;i<6;i++) c->act[i]=clampf(c->act[i],0,1);
 }
+static float ch_absorb_dark_matter(Chambers *c, const char *text, const PeriodicTable *pt){
+    char cur[32]={0}; int wi=0,hits=0; float score=0;
+    for(const char *p=text;;p++){
+        int ch=*p;
+        if(ch&&(isalpha((unsigned char)ch)||ch=='\'')){ if(wi<31) cur[wi++]=(char)tolower((unsigned char)ch); continue; }
+        if(wi>0){
+            cur[wi]=0;
+            for(size_t i=0;i<sizeof(DARK_MATTER_WORDS)/sizeof(DARK_MATTER_WORDS[0]);i++) if(strcmp(cur,DARK_MATTER_WORDS[i].word)==0){ score+=DARK_MATTER_WORDS[i].weight; hits++; break; }
+            if(pt){ int idx=periodic_find(pt,cur); if(idx>=0){ int chamber=pt->elements[idx].chamber; if(chamber==CH_FEAR||chamber==CH_RAGE||chamber==CH_VOID) score+=0.08f*pt->elements[idx].mass; } }
+            wi=0;
+        }
+        if(!ch) break;
+    }
+    if(hits<=0&&score<0.15f){ c->scar=clampf(c->scar*0.995f,0,1); return 0; }
+    float scar=clampf(score/(1.8f+0.25f*hits),0,1);
+    c->scar=clampf(0.90f*c->scar+0.10f*scar,0,1);
+    c->trauma=clampf(c->trauma+0.08f*c->scar,0,1);
+    c->debt=clampf(c->debt+0.05f*c->scar,0,1);
+    c->act[CH_VOID]=clampf(c->act[CH_VOID]+0.10f*c->scar,0,1);
+    c->act[CH_FEAR]=clampf(c->act[CH_FEAR]+0.06f*c->scar,0,1);
+    c->presence=clampf(c->presence*(1.0f-0.08f*c->scar),0,1);
+    return c->scar;
+}
 static int ch_dominant(const Chambers *c){int dom=0;for(int i=1;i<6;i++) if(c->act[i]>c->act[dom]) dom=i;return dom;}
 static float ch_emergence(const Chambers *c){float v=c->act[CH_VOID]>0.10f?c->act[CH_VOID]:0.10f; float f=c->act[CH_FLOW]<0.95f?c->act[CH_FLOW]:0.95f; return (1.0f-v)*f;}
 static void ch_modulate(const Chambers *c, float *a, float *b, float *g, float *t){
@@ -404,11 +606,92 @@ static void ch_summary(const Chambers *c, char *buf, int sz){
     int pos=0; buf[0]=0;
     for(int i=0;i<6;i++) if(c->act[i]>0.05f&&pos<sz-1){int w=snprintf(buf+pos,sz-pos,"%s%s:%.0f%%",pos?" ":"",CH_N[i],c->act[i]*100.0f);if(w>0&&pos+w<sz)pos+=w;else break;}
     if(c->presence>0.05f&&pos<sz-1){int w=snprintf(buf+pos,sz-pos,"%sSOMA:%.0f%%",pos?" ":"",c->presence*100.0f);if(w>0&&pos+w<sz)pos+=w;}
+    if(c->scar>0.05f&&pos<sz-1){int w=snprintf(buf+pos,sz-pos,"%sSCAR:%.0f%%",pos?" ":"",c->scar*100.0f);if(w>0&&pos+w<sz)pos+=w;}
+    if(c->phase_lock>0.05f&&pos<sz-1){int w=snprintf(buf+pos,sz-pos,"%sPHASE:%.0f%%",pos?" ":"",c->phase_lock*100.0f);if(w>0&&pos+w<sz)pos+=w;}
     if(pos==0) snprintf(buf,sz,"quiet");
 }
+static VelocityProfile velocity_profile(const Chambers *c, float dissonance){
+    VelocityProfile vp={VEL_WALK,1,1,1,1,1,1,0,0,1,1,1,0};
+    if(dissonance>0.8f) vp.mode=VEL_UP;
+    else if(dissonance>0.6f) vp.mode=VEL_RUN;
+    else if(dissonance<0.2f) vp.mode=VEL_STOP;
+    else if(c->trauma>0.5f) vp.mode=VEL_BREATHE;
+    else if(c->debt>0.55f) vp.mode=VEL_DOWN;
+    if(vp.mode==VEL_RUN){vp.temp_mul=1.12f;vp.bg_mul=1.15f;vp.interf_bonus=0.05f;}
+    else if(vp.mode==VEL_STOP){vp.temp_mul=0.72f;vp.ds_mul=1.25f;vp.debt_decay=0.75f;}
+    else if(vp.mode==VEL_BREATHE){vp.temp_mul=0.9f;vp.debt_decay=0.65f;vp.trauma_decay=0.75f;vp.scar_decay=0.82f;}
+    else if(vp.mode==VEL_UP){vp.temp_mul=1.22f;vp.pro_mul=1.25f;vp.bg_mul=0.9f;vp.interf_bonus=0.1f;vp.wormhole_bonus=0.05f;}
+    else if(vp.mode==VEL_DOWN){vp.temp_mul=0.82f;vp.heb_mul=1.1f;vp.bg_mul=1.1f;vp.pro_mul=0.9f;}
+    vp.wormhole_bonus-=0.05f*c->scar;
+    vp.interf_bonus-=0.08f*c->scar;
+    vp.dark_pressure=0.18f*c->scar;
+    return vp;
+}
 
-typedef struct{char name[64]; int heavy[MAX_HEAVY]; int n_heavy;}InterferenceDoc;
+typedef struct{int start; int heavy[MAX_HEAVY]; int n_heavy; char keywords[16][32]; int n_keywords;}InterferenceChunk;
+typedef struct{char name[64]; int heavy[MAX_HEAVY]; int n_heavy; char keywords[16][32]; int n_keywords; InterferenceChunk chunks[MAX_DOC_CHUNKS]; int n_chunks;}InterferenceDoc;
 typedef struct{InterferenceDoc docs[MAX_INTERF_DOCS]; int n_docs;}Interference;
+
+static void interf_summarize_ids(const int *ids, int n, const BPE *bpe,
+                                 int *heavy, int *n_heavy,
+                                 char keywords[][32], int *n_keywords,
+                                 int heavy_cap, int kw_cap){
+    MetaW tmp; meta_build(&tmp,ids,n,bpe->vocab_size);
+    int toks[512], cnts[512], nt=0;
+    for(int i=0;i<tmp.n_bi&&nt<512;i++){
+        int pair[2]={tmp.bigrams[i].a,tmp.bigrams[i].b};
+        for(int pi=0;pi<2;pi++){
+            int tok=pair[pi],found=-1;
+            for(int j=0;j<nt;j++) if(toks[j]==tok){found=j;break;}
+            if(found>=0) cnts[found]++;
+            else if(nt<512){toks[nt]=tok;cnts[nt]=1;nt++;}
+        }
+    }
+    *n_heavy=0; *n_keywords=0;
+    for(int pick=0;pick<nt&&*n_heavy<heavy_cap;pick++){
+        int best=-1;
+        for(int i=0;i<nt;i++) if(cnts[i]>=0&&(best<0||cnts[i]>cnts[best]||(cnts[i]==cnts[best]&&toks[i]<toks[best]))) best=i;
+        if(best<0) break;
+        int tok=toks[best]; cnts[best]=-1;
+        char buf[64]; bpe_decode_token(bpe,tok,buf,sizeof(buf));
+        int alpha=0; for(int j=0;buf[j];j++) if(isalpha((unsigned char)buf[j])) alpha++;
+        if(alpha<=2) continue;
+        heavy[(*n_heavy)++]=tok;
+        if(*n_keywords<kw_cap){
+            for(int j=0;buf[j];j++) buf[j]=(char)tolower((unsigned char)buf[j]);
+            strncpy(keywords[*n_keywords],buf,31);
+            keywords[*n_keywords][31]=0;
+            (*n_keywords)++;
+        }
+    }
+    if(*n_heavy==0){
+        int lim=n<heavy_cap?n:heavy_cap;
+        for(int i=0;i<lim;i++) heavy[(*n_heavy)++]=ids[i];
+    }
+}
+
+static float interf_item_score(const int *heavy, int n_heavy, const char keywords[][32], int n_keywords,
+                               const char *text, int dom, const PeriodicTable *pt,
+                               const MetaW *mw, const BPE *bpe){
+    float score=0.01f*(float)n_heavy;
+    (void)heavy;
+    for(int ki=0;ki<n_keywords;ki++){
+        const char *word=keywords[ki];
+        if(text&&strstr(text,word)) score+=1.2f;
+        for(size_t j=0;j<sizeof(ANCHORS)/sizeof(ANCHORS[0]);j++) if(strcmp(word,ANCHORS[j].word)==0&&ANCHORS[j].chamber==dom) score+=0.6f;
+        if(pt){ int idx=periodic_find(pt,word); if(idx>=0&&pt->elements[idx].chamber==dom) score+=0.35f*pt->elements[idx].mass; }
+        if(mw&&bpe){
+            for(int pi=0;pi<mw->n_prophecy;pi++){
+                char pbuf[64]; bpe_decode_token(bpe,mw->prophecies[pi].target,pbuf,sizeof(pbuf));
+                for(int j=0;pbuf[j];j++) pbuf[j]=(char)tolower((unsigned char)pbuf[j]);
+                if(strcmp(word,pbuf)==0) score+=0.9f*mw->prophecies[pi].strength*logf(1.0f+(float)mw->prophecies[pi].age);
+            }
+        }
+    }
+    score+=0.05f*((float)rand()/RAND_MAX);
+    return score;
+}
+
 static void interf_load(Interference *itf, const char *docs_dir, const BPE *bpe){
     static const char *doc_names[]={
         "bach_counterpoint.txt","bioluminescence.txt","byzantine_iconography.txt",
@@ -421,25 +704,61 @@ static void interf_load(Interference *itf, const char *docs_dir, const BPE *bpe)
         fseek(f,0,SEEK_END); long sz=ftell(f); fseek(f,0,SEEK_SET);
         uint8_t *raw=malloc(sz>0?sz:1); fread(raw,1,sz,f); fclose(f);
         int *ids=malloc((sz>0?sz:1)*sizeof(int)); int n=bpe_encode(bpe,raw,(int)sz,ids,(int)sz);
-        MetaW tmp; meta_build(&tmp,ids,n,bpe->vocab_size);
         InterferenceDoc *doc=&itf->docs[itf->n_docs];
         strncpy(doc->name,doc_names[di],sizeof(doc->name)-1);
-        for(int i=0;i<tmp.n_bi&&doc->n_heavy<MAX_HEAVY;i++){
-            int tok=tmp.bigrams[i].a,dup=0; char buf[64]; bpe_decode_token(bpe,tok,buf,sizeof(buf));
-            for(int j=0;j<doc->n_heavy;j++) if(doc->heavy[j]==tok){dup=1;break;}
-            int alpha=0; for(int j=0;buf[j];j++) if(isalpha((unsigned char)buf[j])) alpha++;
-            if(!dup&&alpha>2) doc->heavy[doc->n_heavy++]=tok;
+        interf_summarize_ids(ids,n,bpe,doc->heavy,&doc->n_heavy,doc->keywords,&doc->n_keywords,MAX_HEAVY,16);
+        for(int start=0;start<n&&doc->n_chunks<MAX_DOC_CHUNKS;start+=32){
+            int part_n=(n-start)>64?64:(n-start);
+            if(part_n<12) continue;
+            InterferenceChunk *chunk=&doc->chunks[doc->n_chunks];
+            memset(chunk,0,sizeof(*chunk));
+            chunk->start=start;
+            interf_summarize_ids(ids+start,part_n,bpe,chunk->heavy,&chunk->n_heavy,chunk->keywords,&chunk->n_keywords,16,8);
+            if(chunk->n_heavy>0) doc->n_chunks++;
+        }
+        if(doc->n_chunks==0&&doc->n_heavy>0){
+            InterferenceChunk *chunk=&doc->chunks[doc->n_chunks++];
+            memset(chunk,0,sizeof(*chunk));
+            chunk->start=0;
+            chunk->n_heavy=doc->n_heavy<16?doc->n_heavy:16;
+            memcpy(chunk->heavy,doc->heavy,chunk->n_heavy*sizeof(int));
+            chunk->n_keywords=doc->n_keywords<8?doc->n_keywords:8;
+            for(int i=0;i<chunk->n_keywords;i++){strncpy(chunk->keywords[i],doc->keywords[i],31); chunk->keywords[i][31]=0;}
         }
         if(doc->n_heavy>0) itf->n_docs++;
         free(ids); free(raw);
     }
 }
+static const InterferenceDoc *interf_choose_doc(const Interference *itf, const char *text, const Chambers *c, const PeriodicTable *pt, const MetaW *mw, const BPE *bpe){
+    if(!itf||itf->n_docs<=0) return NULL;
+    int dom=c?ch_dominant(c):CH_FLOW;
+    const InterferenceDoc *best=&itf->docs[rand()%itf->n_docs]; float best_score=-1e30f;
+    for(int di=0;di<itf->n_docs;di++){
+        const InterferenceDoc *doc=&itf->docs[di];
+        float score=interf_item_score(doc->heavy,doc->n_heavy,doc->keywords,doc->n_keywords,text,dom,pt,mw,bpe);
+        if(score>best_score){best_score=score;best=doc;}
+    }
+    return best;
+}
+static const InterferenceChunk *interf_choose_chunk(const InterferenceDoc *doc, const char *text, const Chambers *c, const PeriodicTable *pt, const MetaW *mw, const BPE *bpe){
+    if(!doc||doc->n_chunks<=0) return NULL;
+    int dom=c?ch_dominant(c):CH_FLOW;
+    const InterferenceChunk *best=&doc->chunks[0]; float best_score=-1e30f;
+    for(int ci=0;ci<doc->n_chunks;ci++){
+        const InterferenceChunk *chunk=&doc->chunks[ci];
+        float score=interf_item_score(chunk->heavy,chunk->n_heavy,chunk->keywords,chunk->n_keywords,text,dom,pt,mw,bpe);
+        if(score>best_score){best_score=score;best=chunk;}
+    }
+    return best;
+}
+static int is_clean_seed_token(const BPE *bpe, int id);
 static int interf_seed(const Interference *itf, const Chambers *c, const BPE *bpe, const PeriodicTable *pt){
     if(!itf||itf->n_docs<=0) return -1;
     const InterferenceDoc *doc=&itf->docs[rand()%itf->n_docs];
     if(doc->n_heavy<=0) return -1;
     int dom=ch_dominant(c),best=doc->heavy[rand()%doc->n_heavy]; float best_score=-1e30f;
     for(int i=0;i<doc->n_heavy&&i<MAX_HEAVY;i++){
+        if(!is_clean_seed_token(bpe,doc->heavy[i])) continue;
         char buf[64]; float sc=((float)rand()/RAND_MAX)*0.05f; bpe_decode_token(bpe,doc->heavy[i],buf,sizeof(buf));
         for(int j=0;buf[j];j++) buf[j]=(char)tolower((unsigned char)buf[j]);
         for(size_t j=0;j<sizeof(ANCHORS)/sizeof(ANCHORS[0]);j++) if(strcmp(buf,ANCHORS[j].word)==0&&ANCHORS[j].chamber==dom) sc+=1.0f;
@@ -447,6 +766,52 @@ static int interf_seed(const Interference *itf, const Chambers *c, const BPE *bp
         if(sc>best_score){best_score=sc;best=doc->heavy[i];}
     }
     return best;
+}
+static int interf_seed_from_doc(const InterferenceDoc *doc, const Chambers *c, const BPE *bpe, const PeriodicTable *pt){
+    if(!doc||doc->n_heavy<=0) return -1;
+    int dom=ch_dominant(c),best=doc->heavy[rand()%doc->n_heavy]; float best_score=-1e30f;
+    for(int i=0;i<doc->n_heavy&&i<MAX_HEAVY;i++){
+        if(!is_clean_seed_token(bpe,doc->heavy[i])) continue;
+        char buf[64]; float sc=((float)rand()/RAND_MAX)*0.05f; bpe_decode_token(bpe,doc->heavy[i],buf,sizeof(buf));
+        for(int j=0;buf[j];j++) buf[j]=(char)tolower((unsigned char)buf[j]);
+        for(size_t j=0;j<sizeof(ANCHORS)/sizeof(ANCHORS[0]);j++) if(strcmp(buf,ANCHORS[j].word)==0&&ANCHORS[j].chamber==dom) sc+=1.0f;
+        if(pt){ int idx=periodic_find(pt,buf); if(idx>=0&&pt->elements[idx].chamber==dom) sc+=0.5f*pt->elements[idx].mass; }
+        if(sc>best_score){best_score=sc;best=doc->heavy[i];}
+    }
+    return best;
+}
+static int interf_seed_from_chunk(const InterferenceChunk *chunk, const Chambers *c, const BPE *bpe, const PeriodicTable *pt){
+    if(!chunk||chunk->n_heavy<=0) return -1;
+    int dom=ch_dominant(c),best=chunk->heavy[rand()%chunk->n_heavy]; float best_score=-1e30f;
+    for(int i=0;i<chunk->n_heavy&&i<MAX_HEAVY;i++){
+        if(!is_clean_seed_token(bpe,chunk->heavy[i])) continue;
+        char buf[64]; float sc=((float)rand()/RAND_MAX)*0.05f; bpe_decode_token(bpe,chunk->heavy[i],buf,sizeof(buf));
+        for(int j=0;buf[j];j++) buf[j]=(char)tolower((unsigned char)buf[j]);
+        for(size_t j=0;j<sizeof(ANCHORS)/sizeof(ANCHORS[0]);j++) if(strcmp(buf,ANCHORS[j].word)==0&&ANCHORS[j].chamber==dom) sc+=1.0f;
+        if(pt){ int idx=periodic_find(pt,buf); if(idx>=0&&pt->elements[idx].chamber==dom) sc+=0.5f*pt->elements[idx].mass; }
+        if(sc>best_score){best_score=sc;best=chunk->heavy[i];}
+    }
+    return best;
+}
+static void interf_signal(const InterferenceDoc *doc, float *out, int V){
+    for(int i=0;i<V;i++) out[i]=0;
+    if(!doc) return;
+    float mx=0;
+    for(int rank=0;rank<doc->n_heavy&&rank<16;rank++){
+        int tid=doc->heavy[rank];
+        if(tid>=0&&tid<V){out[tid]+=1.0f/(1.0f+(float)rank); if(out[tid]>mx) mx=out[tid];}
+    }
+    if(mx>1e-8f) for(int i=0;i<V;i++) out[i]/=mx;
+}
+static void interf_signal_chunk(const InterferenceChunk *chunk, float *out, int V){
+    for(int i=0;i<V;i++) out[i]=0;
+    if(!chunk) return;
+    float mx=0;
+    for(int rank=0;rank<chunk->n_heavy&&rank<16;rank++){
+        int tid=chunk->heavy[rank];
+        if(tid>=0&&tid<V){out[tid]+=1.0f/(1.0f+(float)rank); if(out[tid]>mx) mx=out[tid];}
+    }
+    if(mx>1e-8f) for(int i=0;i<V;i++) out[i]/=mx;
 }
 
 /* ── DOE Parliament — Democracy of Experts ── */
@@ -461,24 +826,28 @@ static int interf_seed(const Interference *itf, const Chambers *c, const BPE *bp
 typedef struct{
     float *A;  /* [rank × d_in] */
     float *B;  /* [d_out × rank] */
+    float *trace; /* [rank × d_in] */
     int d_in,d_out,rank;
     float vitality;
+    float overload,resonance,plasticity_mass;
     int age,low_steps;
+    int consolidations;
 }Expert;
 
 typedef struct{
     Expert ex[MAX_EXPERTS]; int n;
     int d_model; float alpha;
-    int step;
+    int step,last_k,last_winners[MAX_EXPERTS],n_winners,last_consolidations,last_births,last_deaths; float last_entropy,last_diversity;
 }Parliament;
 
 static void expert_init(Expert *e, int d_in, int d_out, int rank){
     e->d_in=d_in;e->d_out=d_out;e->rank=rank;
     e->A=calloc(rank*d_in,sizeof(float));
     e->B=calloc(d_out*rank,sizeof(float));
+    e->trace=calloc(rank*d_in,sizeof(float));
     for(int i=0;i<rank*d_in;i++) e->A[i]=0.01f*((float)rand()/RAND_MAX-0.5f);
     for(int i=0;i<d_out*rank;i++) e->B[i]=0.01f*((float)rand()/RAND_MAX-0.5f);
-    e->vitality=1.0f;e->age=0;e->low_steps=0;
+    e->vitality=1.0f;e->overload=0;e->resonance=0;e->plasticity_mass=0;e->age=0;e->low_steps=0;e->consolidations=0;
 }
 
 static void expert_forward(const Expert *e, const float *x, float *out){
@@ -493,13 +862,34 @@ static void expert_hebbian(Expert *e, const float *x, const float *dy, float lr)
     for(int r=0;r<e->rank;r++){
         float u=0;for(int o=0;o<e->d_out;o++) u+=e->B[o*e->rank+r]*dy[o];
         u+=0.01f*((float)rand()/RAND_MAX-0.5f);
-        for(int d=0;d<e->d_in;d++) e->A[r*e->d_in+d]+=lr*x[d]*u;
+        for(int d=0;d<e->d_in;d++){
+            float delta=lr*x[d]*u;
+            int idx=r*e->d_in+d;
+            e->A[idx]+=delta;
+            e->trace[idx]=0.96f*e->trace[idx]+0.04f*delta;
+            e->plasticity_mass+=fabsf(delta);
+        }
         for(int o=0;o<e->d_out;o++) e->B[o*e->rank+r]*=0.999f;
     }
 }
+static int expert_consolidate(Expert *e){
+    if(e->plasticity_mass<0.002f) return 0;
+    float norm=0; int n=e->rank*e->d_in;
+    for(int i=0;i<n;i++) norm+=fabsf(e->trace[i]);
+    norm/=n>0?n:1;
+    if(norm<1e-8f) return 0;
+    {float gain=clampf(0.02f+0.35f*e->plasticity_mass,0,0.12f);
+    for(int i=0;i<n;i++){ e->A[i]+=gain*e->trace[i]/norm; e->trace[i]*=0.45f; }}
+    e->vitality=clampf(e->vitality+0.04f,0,1);
+    e->overload*=0.88f;
+    e->resonance=clampf(e->resonance+0.03f,-1,1);
+    e->plasticity_mass*=0.35f;
+    e->consolidations++;
+    return 1;
+}
 
 static void parl_init(Parliament *p, int d_model, int n_init){
-    p->d_model=d_model;p->alpha=DOE_ALPHA;p->step=0;
+    p->d_model=d_model;p->alpha=DOE_ALPHA;p->step=0;p->last_k=0;p->last_entropy=0;p->last_diversity=0;p->n_winners=0;p->last_consolidations=0;p->last_births=0;p->last_deaths=0;
     p->n=n_init<MAX_EXPERTS?n_init:MAX_EXPERTS;
     for(int i=0;i<p->n;i++) expert_init(&p->ex[i],d_model,d_model,DOE_RANK);
 }
@@ -515,24 +905,63 @@ static void parl_election(Parliament *p, const float *x, float *result){
         float dot=0;for(int d=0;d<p->d_model;d++) dot+=outs[i][d]*x[d];
         votes[i]=dot;
     }
-    /* consensus */
-    float mx=votes[0],mn=votes[0];
-    for(int i=1;i<p->n;i++){if(votes[i]>mx)mx=votes[i];if(votes[i]<mn)mn=votes[i];}
-    float cons=(mx-mn)/(fabsf(mx)+fabsf(mn)+1e-8f);
-    int k=(int)(p->n*(1.0f-cons));if(k<1)k=1;if(k>p->n)k=p->n;
     /* top-k by insertion sort on indices */
     int sel[MAX_EXPERTS];for(int i=0;i<p->n;i++) sel[i]=i;
     for(int i=0;i<p->n-1;i++) for(int j=i+1;j<p->n;j++)
         if(votes[sel[j]]>votes[sel[i]]){int t=sel[i];sel[i]=sel[j];sel[j]=t;}
-    /* softmax over top-k */
-    float sv=votes[sel[0]],exps[MAX_EXPERTS],tot=0;
-    for(int i=0;i<k;i++){exps[i]=expf(votes[sel[i]]-sv);tot+=exps[i];}
-    for(int i=0;i<k;i++){
-        float w=exps[i]/tot;
-        for(int d=0;d<p->d_model;d++) result[d]+=w*outs[sel[i]][d];
-        p->ex[sel[i]].vitality=0.9f*p->ex[sel[i]].vitality+0.1f*fabsf(w);
+    float sv=votes[sel[0]],dist[MAX_EXPERTS],dist_tot=0,entropy=0;
+    for(int i=0;i<p->n;i++){dist[i]=expf(votes[i]-sv);dist_tot+=dist[i];}
+    if(dist_tot>0) for(int i=0;i<p->n;i++){float pr=dist[i]/dist_tot; if(pr>1e-12f) entropy-=pr*logf(pr);}
+    entropy/=logf((float)(p->n>1?p->n:2));
+    int k=1+(int)((p->n-1)*clampf(entropy,0,1)); if(k<1)k=1; if(k>p->n)k=p->n;
+    p->last_k=k; p->last_entropy=entropy;
+    /* novelty-aware winner selection over top-k budget */
+    int winners[MAX_EXPERTS], n_winners=0;
+    unsigned char picked[MAX_EXPERTS]={0};
+    float diversity_sum=0;
+    for(int slot=0;slot<k;slot++){
+        int best_idx=-1; float best_score=-1e30f, best_novelty=0;
+        for(int si=0;si<p->n;si++){
+            int idx=sel[si]; if(picked[idx]) continue;
+            float novelty=1.0f;
+            if(n_winners>0){
+                float sim_sum=0;
+                float base_norm=1e-8f; for(int d=0;d<p->d_model;d++) base_norm+=outs[idx][d]*outs[idx][d];
+                base_norm=sqrtf(base_norm);
+                for(int wi=0;wi<n_winners;wi++){
+                    int prev=winners[wi];
+                    float other_norm=1e-8f,dot=0; for(int d=0;d<p->d_model;d++){ dot+=outs[idx][d]*outs[prev][d]; other_norm+=outs[prev][d]*outs[prev][d]; }
+                    other_norm=sqrtf(other_norm);
+                    {float sim=dot/(base_norm*other_norm); if(sim<0) sim=0; sim_sum+=sim;}
+                }
+                novelty=clampf(1.0f-sim_sum/n_winners,0,1);
+            }
+            {float score=votes[idx]+0.08f*novelty-0.06f*p->ex[idx].overload-0.03f*clampf(p->ex[idx].resonance,0,1);
+            if(score>best_score){best_score=score;best_idx=idx;best_novelty=novelty;}}
+        }
+        if(best_idx<0) break;
+        winners[n_winners++]=best_idx; picked[best_idx]=1; diversity_sum+=best_novelty;
     }
-    for(int i=k;i<p->n;i++){p->ex[sel[i]].vitality*=0.95f;p->ex[sel[i]].low_steps++;}
+    p->n_winners=n_winners; p->last_diversity=n_winners>0?diversity_sum/n_winners:0;
+    for(int i=0;i<n_winners;i++) p->last_winners[i]=winners[i];
+    /* softmax over winners */
+    float exps[MAX_EXPERTS],tot=0;
+    for(int i=0;i<n_winners;i++){exps[i]=expf(votes[winners[i]]-sv);tot+=exps[i];}
+    for(int i=0;i<n_winners;i++){
+        int idx=winners[i];
+        float w=exps[i]/tot;
+        for(int d=0;d<p->d_model;d++) result[d]+=w*outs[idx][d];
+        p->ex[idx].vitality=0.86f*p->ex[idx].vitality+0.14f*fabsf(w);
+        p->ex[idx].resonance=0.88f*p->ex[idx].resonance+0.12f*votes[idx];
+        p->ex[idx].overload=clampf(0.90f*p->ex[idx].overload+0.20f*((w-0.30f)>0?(w-0.30f):0),0,1);
+        p->ex[idx].low_steps=0;
+    }
+    for(int idx=0;idx<p->n;idx++) if(!picked[idx]){
+        float recovery=0.015f+0.03f*(1.0f-p->ex[idx].overload);
+        p->ex[idx].vitality=clampf(0.96f*p->ex[idx].vitality+recovery*clampf(fabsf(p->ex[idx].resonance),0,1),0,1);
+        p->ex[idx].overload*=0.92f;
+        p->ex[idx].low_steps++;
+    }
     for(int i=0;i<p->n;i++) free(outs[i]);
 }
 
@@ -548,32 +977,34 @@ static void parl_notorch(Parliament *p, const float *x, const float *debt, int d
     int n=dlen<p->d_model?dlen:p->d_model;
     float *ds=calloc(p->d_model,sizeof(float));
     for(int i=0;i<n;i++) ds[i]=debt[i];
-    for(int i=0;i<p->n;i++){expert_hebbian(&p->ex[i],x,ds,0.001f);p->ex[i].age++;}
+    p->last_consolidations=0;
+    for(int i=0;i<p->n;i++){expert_hebbian(&p->ex[i],x,ds,0.001f); if(p->ex[i].plasticity_mass>0.002f&&expert_consolidate(&p->ex[i])) p->last_consolidations++; p->ex[i].age++;}
     free(ds);
 }
 
 static void parl_lifecycle(Parliament *p){
     /* apoptosis */
-    int alive=0;
+    int alive=0,before=p->n;
     for(int i=0;i<p->n;i++){
-        if(p->ex[i].low_steps>=8&&p->ex[i].vitality<0.1f&&p->n>2){
-            free(p->ex[i].A);free(p->ex[i].B);continue;}
+        if(p->ex[i].low_steps>=12&&p->ex[i].vitality<0.06f&&fabsf(p->ex[i].resonance)<0.05f&&p->n>2&&p->ex[i].age>28){
+            free(p->ex[i].A);free(p->ex[i].B);free(p->ex[i].trace);continue;}
         if(alive!=i) p->ex[alive]=p->ex[i];alive++;
     }
-    p->n=alive;
+    p->n=alive; p->last_deaths=before-p->n;
     /* mitosis */
     int births=0;
     for(int i=0;i<p->n&&p->n+births<MAX_EXPERTS;i++){
-        if(p->ex[i].vitality>0.8f&&p->ex[i].age>50){
+        if(p->ex[i].vitality>0.70f&&p->ex[i].age>40&&p->ex[i].overload>0.32f){
             Expert *c=&p->ex[p->n+births];
             expert_init(c,p->ex[i].d_in,p->ex[i].d_out,p->ex[i].rank);
             for(int j=0;j<c->rank*c->d_in;j++) c->A[j]=p->ex[i].A[j]+0.005f*((float)rand()/RAND_MAX-0.5f);
             for(int j=0;j<c->d_out*c->rank;j++) c->B[j]=p->ex[i].B[j]+0.005f*((float)rand()/RAND_MAX-0.5f);
-            c->vitality=0.5f;births++;
-            p->ex[i].vitality*=0.6f;
+            c->vitality=0.5f;c->overload=0.18f;c->resonance=0.5f*p->ex[i].resonance;births++;
+            p->ex[i].vitality*=0.62f;
+            p->ex[i].overload*=0.5f;
         }
     }
-    p->n+=births;p->step++;
+    p->n+=births; p->last_births=births; p->step++;
 }
 
 /* ── Transformer ── */
@@ -699,6 +1130,10 @@ static void tf_forward(TF *t, int tok, int pos){
     t->clen=sl; free(x);free(xn);free(xr);
 }
 
+static int is_clean_seed_token(const BPE *bpe, int id);
+static int starts_with_space(const BPE *bpe, int id);
+static float surface_transition_adjust(const BPE *bpe, int prev_id, int cur_id, int step);
+
 /* ── coherence score ── */
 static float coherence_score(const MetaW *mw, const int *ids, int n, int V){
     /* score a token sequence by bigram + trigram + Hebbian density */
@@ -729,6 +1164,53 @@ static float coherence_score(const MetaW *mw, const int *ids, int n, int V){
     float tri_norm=n>2?tri_sum/(n-2):0;
     return bi_sum/(n-1)+0.5f*hb_sum/(n-1)+0.8f*tri_norm+len_bonus;
 }
+static float surface_coherence_score(const BPE *bpe, const int *ids, int n){
+    if(n<=0) return -1.0f;
+    float score=surface_transition_adjust(bpe,-1,ids[0],0);
+    if(is_clean_seed_token(bpe,ids[0])) score+=0.18f;
+    int limit=n<12?n:12;
+    for(int i=1;i<limit;i++) score+=surface_transition_adjust(bpe,ids[i-1],ids[i],1);
+    return score;
+}
+static float metaweights_field_scale(int step){
+    return clampf(0.55f + 0.045f * (float)step, 0.55f, 1.0f);
+}
+static float prompt_focus_scale(int has_tf, int plen, int step){
+    if(has_tf||plen<=1) return 1.0f;
+    if(step<=4) return 0.62f;
+    if(step<=8) return 0.82f;
+    return 1.0f;
+}
+static int anchored_prompt_from_input(const BPE *bpe, const char *text, int *out, int max_tokens){
+    int inp_ids[128];
+    int inp_n=bpe_encode(bpe,(const uint8_t*)text,(int)strlen(text),inp_ids,128);
+    if(inp_n<=0) return 0;
+    int start=0;
+    if(!is_clean_seed_token(bpe,inp_ids[start])){
+        int found=0;
+        for(int i=1;i<inp_n;i++) if(starts_with_space(bpe,inp_ids[i])&&is_clean_seed_token(bpe,inp_ids[i])){start=i;found=1;break;}
+        if(!found) for(int i=1;i<inp_n;i++) if(starts_with_space(bpe,inp_ids[i])){start=i;break;}
+    }
+    int n=inp_n-start; if(n>max_tokens) n=max_tokens;
+    if(n<=0) return 0;
+    for(int i=0;i<n;i++) out[i]=inp_ids[start+i];
+    return n;
+}
+static float early_sentence_quality(const BPE *bpe, const int *ids, int n){
+    if(n<=0) return -1.0f;
+    float score=surface_coherence_score(bpe,ids,n);
+    if(n<8) score-=0.4f;
+    if(!is_clean_seed_token(bpe,ids[0])) score-=0.6f;
+    char text[256]={0}; int pos=0;
+    for(int i=0;i<n&&i<10;i++){
+        char buf[64]; int len=bpe_decode_token(bpe,ids[i],buf,sizeof(buf));
+        if(len>0&&pos+len<(int)sizeof(text)-1){memcpy(text+pos,buf,len);pos+=len;text[pos]=0;}
+    }
+    char *p=text; while(*p&&isspace((unsigned char)*p)) p++;
+    if(p[0]&&p[1]&&islower((unsigned char)p[0])) score-=0.4f;
+    if(strstr(p,"...")) score-=0.2f;
+    return score;
+}
 
 /* ── boundary check ── */
 static int is_boundary(const BPE *bpe, int id){
@@ -751,14 +1233,54 @@ static int starts_with_space(const BPE *bpe, int id){
     if(id<0||id>=bpe->vocab_size||bpe->vocab_len[id]==0)return 0;
     return bpe->vocab_bytes[id][0]==' ';
 }
+static int opens_segment(const BPE *bpe, int id){
+    if(id<0||id>=bpe->vocab_size) return 1;
+    for(int i=bpe->vocab_len[id]-1;i>=0;i--){
+        uint8_t c=bpe->vocab_bytes[id][i];
+        if(c==' '||c=='\n'||c=='\r'||c=='\t') continue;
+        return c=='('||c=='['||c=='{'||c=='"'||c=='\''||c==':'||c==';';
+    }
+    return 1;
+}
+static int is_lower_fragment_start(const BPE *bpe, int id){
+    if(id<0||id>=bpe->vocab_size||bpe->vocab_len[id]==0) return 0;
+    uint8_t c=bpe->vocab_bytes[id][0];
+    return c!=' '&&c>='a'&&c<='z';
+}
+static int is_clean_seed_token(const BPE *bpe, int id){
+    if(id<0||id>=bpe->vocab_size||bpe->vocab_len[id]==0) return 0;
+    if(starts_with_space(bpe,id)) return 1;
+    uint8_t c=bpe->vocab_bytes[id][0];
+    return !(c>='a'&&c<='z');
+}
+static float surface_transition_adjust(const BPE *bpe, int prev_id, int cur_id, int step){
+    if(cur_id<0||cur_id>=bpe->vocab_size) return 0.0f;
+    if(step==0) return is_lower_fragment_start(bpe,cur_id)?-1.15f:0.0f;
+    if(prev_id>=0&&(is_boundary(bpe,prev_id)||opens_segment(bpe,prev_id))){
+        if(is_lower_fragment_start(bpe,cur_id)) return -1.05f;
+        if(starts_with_space(bpe,cur_id)) return 0.06f;
+    }
+    return 0.0f;
+}
+static int display_start_index(const BPE *bpe, const int *ids, int n){
+    for(int i=0;i<n;i++){
+        char buf[128]; int len=bpe_decode_token(bpe,ids[i],buf,sizeof(buf));
+        if(len<=0) continue;
+        if(i==0 && (isalnum((unsigned char)buf[0]) || buf[0]=='"' || buf[0]=='\'' || buf[0]=='(' || buf[0]=='[' || buf[0]=='{')) return i;
+        if(isspace((unsigned char)buf[0])) return i;
+    }
+    return 0;
+}
 
 /* ── generate sentence ── */
 static int gen_sent(TF *t, const BPE *bpe, MetaW *mw,
                     const int *prompt, int plen, float temp,
                     int *out, int maxo, Parliament *parl, float *global_destiny,
-                    Chambers *ch_ptr){
+                    Chambers *ch_ptr, const VelocityProfile *vel, const float *doc_signal){
     tf_reset(t); int V=t->V,D=t->D;
     float *destiny=calloc(D,sizeof(float));
+    float *prompt_anchor=calloc(D,sizeof(float));
+    float prompt_anchor_norm=0.0f;
     /* inherit global destiny direction (thematic coherence across chain) */
     if(global_destiny) for(int d=0;d<D;d++) destiny[d]=0.3f*global_destiny[d];
     float *prev_logits=calloc(V,sizeof(float));
@@ -766,7 +1288,15 @@ static int gen_sent(TF *t, const BPE *bpe, MetaW *mw,
     int ctx[MAX_SEQ],cl=0,gl=0;
     float am=1.0f,bm=1.0f,gm=1.0f,tm=1.0f;
     if(ch_ptr) ch_modulate(ch_ptr,&am,&bm,&gm,&tm);
-    for(int i=0;i<plen&&i<t->CTX-1;i++){tf_forward(t,prompt[i],i);ctx[cl++]=prompt[i];out[gl++]=prompt[i];}
+    for(int i=0;i<plen&&i<t->CTX-1;i++){tf_forward(t,prompt[i],i);ctx[cl++]=prompt[i];out[gl++]=prompt[i];
+        if(prompt[i]>=0&&prompt[i]<t->V) for(int d=0;d<D;d++) prompt_anchor[d]+=t->tok[prompt[i]*D+d];
+    }
+    if(plen>0){
+        float inv=1.0f/(float)plen;
+        for(int d=0;d<D;d++) prompt_anchor[d]*=inv;
+        for(int d=0;d<D;d++) prompt_anchor_norm+=prompt_anchor[d]*prompt_anchor[d];
+        prompt_anchor_norm=sqrtf(prompt_anchor_norm+1e-10f);
+    }
     for(int step=0;step<120&&gl<maxo;step++){
         int pos=cl-1; if(pos>=t->CTX-1) break;
         tf_forward(t,ctx[cl-1],pos);
@@ -807,24 +1337,59 @@ static int gen_sent(TF *t, const BPE *bpe, MetaW *mw,
         float *pro=calloc(V,sizeof(float));
         int hs=cl>8?cl-8:0; meta_hebb(mw,ctx+hs,cl-hs,heb,V);
         meta_prophecy(mw,ctx,cl,pro,V);
+        float p_debt=prophecy_pressure(mw);
         /* trauma gravity: high trauma dampens all logits */
         if(ch_ptr&&ch_ptr->trauma>0.1f)
             for(int i=0;i<V;i++) raw[i]/=(1.0f+ch_ptr->trauma);
+        if(ch_ptr&&ch_ptr->scar>0.05f){
+            for(int i=0;i<V;i++) raw[i]*=(1.0f-0.08f*ch_ptr->scar);
+            for(size_t ai=0;ai<sizeof(ANCHORS)/sizeof(ANCHORS[0]);ai++) if(ANCHORS[ai].chamber==CH_VOID){
+                int tok=bpe_find_token_exact(bpe,ANCHORS[ai].word);
+                if(tok>=0&&tok<V) raw[tok]+=0.12f*ch_ptr->scar;
+            }
+        }
         /* detect if transformer is active via gate magnitude */
         float tmag=0;for(int v=0;v<V;v++) tmag+=fabsf(raw[v]);tmag/=(V>0?V:1);
         int has_tf=tmag>0.1f;
         /* Dario field: B + α·H + β·P + γ·D + T — stronger without weights */
         float c_heb=(has_tf?0.6f:1.0f)*am, c_pro=(has_tf?0.4f:0.7f)*bm;
         float c_ds=(has_tf?0.3f:0.15f)*gm, c_bg=has_tf?5.0f:15.0f, c_tg=has_tf?3.0f:10.0f;
-        for(int i=0;i<V;i++){
-            float bg=meta_bi(mw,ctx[cl-1],i);
-            float tg=cl>=2?meta_tri(mw,ctx[cl-2],ctx[cl-1],i):1e-10f;
-            float ds=0;
-            if(dn>1e-8f){float en=0;for(int d=0;d<D;d++) en+=t->tok[i*D+d]*t->tok[i*D+d];
-                en=sqrtf(en+1e-10f);if(en>1e-8f){float dot=0;for(int d=0;d<D;d++) dot+=destiny[d]*t->tok[i*D+d];ds=dot/(dn*en);}}
-            raw[i]+=c_heb*heb[i]+c_pro*pro[i]+c_ds*ds+c_bg*bg+c_tg*tg;
-            if(mw->unigram[i]<1e-6f) raw[i]-=2.0f;
-            else if(mw->unigram[i]>0.01f) raw[i]-=0.3f*(mw->unigram[i]-0.01f)*100.0f;
+        if(vel){c_heb*=vel->heb_mul;c_pro*=vel->pro_mul*(1.0f+0.35f*p_debt);c_ds*=vel->ds_mul*(1.0f-0.20f*vel->dark_pressure);c_bg*=vel->bg_mul;c_tg*=vel->tg_mul;}
+        float c_doc=has_tf?0.18f:0.32f;
+        if(!has_tf){
+            float mw_scale=metaweights_field_scale(step);
+            c_pro*=mw_scale;
+            c_bg*=mw_scale;
+            c_tg*=mw_scale;
+            c_doc*=mw_scale;
+        }
+        {
+            float focus=prompt_focus_scale(has_tf,plen,step);
+            c_pro*=focus;
+            c_bg*=focus;
+            c_tg*=focus;
+            c_doc*=focus;
+            float c_prompt=0.0f;
+            if(has_tf&&prompt_anchor_norm>1e-8f&&step<6) c_prompt=(step<2?0.14f:0.09f)*focus;
+            for(int i=0;i<V;i++){
+                float bg=meta_bi(mw,ctx[cl-1],i);
+                float tg=cl>=2?meta_tri(mw,ctx[cl-2],ctx[cl-1],i):1e-10f;
+                float ds=0;
+                if(dn>1e-8f){float en=0;for(int d=0;d<D;d++) en+=t->tok[i*D+d]*t->tok[i*D+d];
+                    en=sqrtf(en+1e-10f);if(en>1e-8f){float dot=0;for(int d=0;d<D;d++) dot+=destiny[d]*t->tok[i*D+d];ds=dot/(dn*en);}}
+                raw[i]+=c_heb*heb[i]+c_pro*pro[i]+c_ds*ds+c_bg*bg+c_tg*tg;
+                if(doc_signal) raw[i]+=c_doc*doc_signal[i];
+                if(c_prompt>0.0f){
+                    float en=0; for(int d=0;d<D;d++) en+=t->tok[i*D+d]*t->tok[i*D+d];
+                    en=sqrtf(en+1e-10f);
+                    if(en>1e-8f){
+                        float dot=0; for(int d=0;d<D;d++) dot+=prompt_anchor[d]*t->tok[i*D+d];
+                        raw[i]+=c_prompt*(dot/(prompt_anchor_norm*en));
+                    }
+                }
+                if(mw->unigram[i]<1e-6f) raw[i]-=2.0f;
+                else if(mw->unigram[i]>0.01f) raw[i]-=0.3f*(mw->unigram[i]-0.01f)*100.0f;
+            }
         }
         free(heb); free(pro);
         /* repetition penalty: stronger for recent, milder for older */
@@ -839,17 +1404,25 @@ static int gen_sent(TF *t, const BPE *bpe, MetaW *mw,
         if(cl>=2){for(int ri=0;ri<cl-1;ri++){
             if(ctx[ri]==ctx[cl-2]&&ctx[ri+1]<V) raw[ctx[ri+1]]*=0.2f;
         }}
+        {
+            int prev_tok=cl>0?ctx[cl-1]:-1;
+            for(int i=0;i<V;i++) raw[i]+=surface_transition_adjust(bpe,prev_tok,i,step);
+        }
         /* hybrid decode: without weights → more greedy; with weights → nucleus after greedy start */
         int ch;
         if(!has_tf){/* no transformer: greedy with slight noise */
-            if(step<6){ch=0;float mx=raw[0];for(int i=1;i<V;i++) if(raw[i]>mx){mx=raw[i];ch=i;}
-            }else{ch=sample_nucleus(raw,V,0.5f,0.7f);}
-        }else if(step<4){
+            if(step<10){ch=0;float mx=raw[0];for(int i=1;i<V;i++) if(raw[i]>mx){mx=raw[i];ch=i;}
+            }else{ch=sample_nucleus(raw,V,0.35f,0.55f);}
+        }else if(step<2){
             ch=0;float mx=raw[0];for(int i=1;i<V;i++) if(raw[i]>mx){mx=raw[i];ch=i;}
-        }else{ch=sample_nucleus(raw,V,clampf(temp*tm,0.3f,1.2f),0.85f);}
+        }else if(step<5){
+            float vm=vel?vel->temp_mul:1.0f;
+            ch=sample_nucleus(raw,V,clampf(temp*tm*vm*0.72f,0.22f,0.55f),0.60f);
+        }else{float vm=vel?vel->temp_mul:1.0f;ch=sample_nucleus(raw,V,clampf(temp*tm*vm,0.25f,1.35f),0.85f);}
         free(raw);
         prev_chosen=ch;
         out[gl++]=ch; ctx[cl++]=ch;
+        prophecy_update(mw,ch);
         /* word capture: online MetaWeight update (NOTORCH) */
         if(cl>=2){
             int prev=ctx[cl-2],cur=ctx[cl-1];
@@ -859,6 +1432,10 @@ static int gen_sent(TF *t, const BPE *bpe, MetaW *mw,
             }
             if(mw->n_bi<MAX_BIGRAM){mw->bigrams[mw->n_bi].a=prev;mw->bigrams[mw->n_bi].b=cur;mw->bigrams[mw->n_bi].prob=0.01f;mw->n_bi++;}
             bi_done:;
+            {int best_pred=-1; float best_prob=0;
+            for(int i=0;i<mw->n_tri;i++) if(mw->trigrams[i].a==prev&&mw->trigrams[i].b==cur&&mw->trigrams[i].prob>best_prob){best_prob=mw->trigrams[i].prob;best_pred=mw->trigrams[i].c;}
+            if(best_pred<0) for(int i=0;i<mw->n_bi;i++) if(mw->bigrams[i].a==cur&&mw->bigrams[i].prob>best_prob){best_prob=mw->bigrams[i].prob;best_pred=mw->bigrams[i].b;}
+            if(best_pred>=0) prophecy_add(mw,best_pred,0.2f+0.5f*best_prob);}
             /* update Hebbian: co-occurrence with recent window */
             int hw=cl>6?cl-6:0;
             for(int ri=hw;ri<cl-1;ri++){
@@ -875,7 +1452,7 @@ static int gen_sent(TF *t, const BPE *bpe, MetaW *mw,
     }
     /* export destiny back to global (0.7 old + 0.3 new) */
     if(global_destiny) for(int d=0;d<D;d++) global_destiny[d]=0.7f*global_destiny[d]+0.3f*destiny[d];
-    free(destiny);free(prev_logits); return gl;
+    free(destiny);free(prev_logits);free(prompt_anchor); return gl;
 }
 
 /* ── SPA — Sentence Phonon Attention ── */
@@ -953,13 +1530,20 @@ static void gen_chain(TF *t, const BPE *bpe, MetaW *mw, Chambers *ch,
         int uids[512]; int ulen=bpe_encode(bpe,(const uint8_t*)input_text,(int)strlen(input_text),uids,512);
         ingest_ids(mw,uids,ulen,0.02f);
         ch_feel_text(ch,input_text,pt);
+        float scar=ch_absorb_dark_matter(ch,input_text,pt);
+        if(scar>0) qexp_add_scar(-1,scar,"prompt");
         ch->act[CH_FLOW]=clampf(ch->act[CH_FLOW]+0.1f,0,1);
         ch_xfire(ch,8);
     }
+    VelocityProfile vel=velocity_profile(ch,cd);
+    ch->debt=clampf((0.88f*ch->debt+0.12f*prophecy_pressure(mw))*vel.debt_decay,0,1);
+    ch->trauma=clampf(ch->trauma*vel.trauma_decay,0,1);
+    ch->scar=clampf(ch->scar*vel.scar_decay,0,1);
+    float phase_gate=soft_phase_gate(ch,coherence_env_pressure(ch,cd,prophecy_pressure(mw),0));
 
     char chbuf[256];
     ch_summary(ch,chbuf,sizeof(chbuf));
-    printf("\n  diss=%.3f debt=%.3f emrg=%.3f %s\n  chambers: %s",cd,ch->debt,ch_emergence(ch),has_weights?"[TRAINED]":"[METAWEIGHTS ONLY]",chbuf);
+    printf("\n  diss=%.3f debt=%.3f scar=%.3f gate=%.3f emrg=%.3f vel=%s %s\n  chambers: %s",cd,ch->debt,ch->scar,phase_gate,ch_emergence(ch),VEL_N[vel.mode],has_weights?"[TRAINED]":"[METAWEIGHTS ONLY]",chbuf);
     if(parl) {float av=0;for(int i=0;i<parl->n;i++) av+=parl->ex[i].vitality;av/=(parl->n>0?parl->n:1);
         printf("\n  parliament: %d experts, avg_vitality=%.2f",parl->n,av);}
     if(itf&&itf->n_docs>0) printf("\n  interference: %d docs loaded",itf->n_docs);
@@ -969,15 +1553,30 @@ static void gen_chain(TF *t, const BPE *bpe, MetaW *mw, Chambers *ch,
     SPACtx spa; spa_init(&spa,t->V);
     int chain_ids[CHAIN_STEPS][256]; int chain_lens[CHAIN_STEPS];
     for(int si=0;si<CHAIN_STEPS;si++){
+        janus_phase_pressure(ch,si,CHAIN_STEPS);
+        float d_phase=(float)si/(float)CHAIN_STEPS;
+        qexp_add_phase(si,d_phase<0.33f?"flow":(d_phase<0.66f?"fear":"void"),ch);
         int dir=si<nb?-1:(si==nb?0:1);
-        int prompt[5]={0},plen=0,used_interf=0;
-        if(itf&&itf->n_docs>0&&((float)rand()/RAND_MAX)<0.3f){
-            int seed=interf_seed(itf,ch,bpe,pt);
-            if(seed>=0){prompt[0]=seed;plen=1;used_interf=1;}
+        const InterferenceDoc *active_doc=(itf&&itf->n_docs>0)?interf_choose_doc(itf,input_text,ch,pt,mw,bpe):NULL;
+        const InterferenceChunk *active_chunk=active_doc?interf_choose_chunk(active_doc,input_text,ch,pt,mw,bpe):NULL;
+        if(active_chunk) qexp_add_chunk(si,active_doc?active_doc->name:"",active_chunk->start,(float)active_chunk->n_heavy);
+        float *doc_signal=NULL;
+        if(active_chunk){
+            doc_signal=calloc(t->V,sizeof(float));
+            interf_signal_chunk(active_chunk,doc_signal,t->V);
+            if(active_chunk->n_heavy>0){
+                int seed_tok=active_chunk->heavy[0];
+                for(int hi=0;hi<active_chunk->n_heavy;hi++) if(is_clean_seed_token(bpe,active_chunk->heavy[hi])){seed_tok=active_chunk->heavy[hi];break;}
+                if(seed_tok>=0&&seed_tok<t->V) for(int d=0;d<t->D;d++) gdest[d]=0.97f*gdest[d]+0.03f*t->tok[seed_tok*t->D+d];
+            }
         }
-        if(plen==0&&input_text&&input_text[0]){
-            int inp_ids[128]; int inp_n=bpe_encode(bpe,(const uint8_t*)input_text,(int)strlen(input_text),inp_ids,128);
-            if(inp_n>0){int st=rand()%(inp_n>2?inp_n-1:1); prompt[0]=inp_ids[st]; if(st+1<inp_n){prompt[1]=inp_ids[st+1];plen=2;}else plen=1;}
+        int prompt[5]={0},plen=0,used_interf=0;
+        if(input_text&&input_text[0]){
+            plen=anchored_prompt_from_input(bpe,input_text,prompt,4);
+        }
+        if(plen==0&&itf&&itf->n_docs>0&&((float)rand()/RAND_MAX)<clampf(0.3f+vel.interf_bonus,0.05f,0.5f)){
+            int seed=active_chunk?interf_seed_from_chunk(active_chunk,ch,bpe,pt):(active_doc?interf_seed_from_doc(active_doc,ch,bpe,pt):interf_seed(itf,ch,bpe,pt));
+            if(seed>=0){prompt[0]=seed;plen=1;used_interf=1;}
         }
         if(plen==0){
             int start=-1;
@@ -1012,30 +1611,45 @@ static void gen_chain(TF *t, const BPE *bpe, MetaW *mw, Chambers *ch,
         float schumann=0.4f*sinf(2*M_PI*7.83f*t_sec)+0.2f*sinf(2*M_PI*14.3f*t_sec)
                        +0.1f*sinf(2*M_PI*20.8f*t_sec)+0.05f*sinf(2*M_PI*27.3f*t_sec);
         float base_temp=has_weights?0.6f:0.75f;
-        float temp=clampf(base_temp+0.08f*schumann,0.4f,0.85f);
+        float temp=clampf((base_temp+0.08f*schumann)*vel.temp_mul,0.35f,0.95f);
         /* best-of-3: generate 3 candidates, pick highest coherence */
         int best_out[256],best_ol=0; float best_sc=-1e30f;
+        float best_q=-1e30f;
         float gdest_save[256]; if(t->D<=256) memcpy(gdest_save,gdest,t->D*sizeof(float));
-        for(int cand=0;cand<3;cand++){
+        int cand_trials=(!has_weights&&si<=1)?5:3;
+        for(int cand=0;cand<cand_trials;cand++){
             if(cand>0&&t->D<=256) memcpy(gdest,gdest_save,t->D*sizeof(float)); /* restore destiny */
-            int out[256],ol=gen_sent(t,bpe,mw,prompt,plen,temp,out,256,parl,gdest,ch);
-            float sc=coherence_score(mw,out,ol,t->V);
+            float cand_temp=temp;
+            if(!has_weights&&si<=1&&cand>0) cand_temp=clampf(temp*(0.92f-0.06f*(float)(cand<3?cand:3)),0.28f,temp);
+            int out[256],ol=gen_sent(t,bpe,mw,prompt,plen,cand_temp,out,256,parl,gdest,ch,&vel,doc_signal);
+            float sc=coherence_score(mw,out,ol,t->V)+0.6f*surface_coherence_score(bpe,out,ol);
+            float q_sc=(!has_weights&&si<=1)?early_sentence_quality(bpe,out,ol):sc;
+            if(q_sc>best_q) best_q=q_sc;
             if(sc>best_sc){best_sc=sc;best_ol=ol;memcpy(best_out,out,ol*sizeof(int));}
-            if(best_sc>1.0f&&best_ol>12) break; /* early exit if first candidate is strong */
+            if(best_q>0.1f&&best_sc>1.0f&&best_ol>12) break; /* early exit if first candidate is strong */
         }
         int wormhole=0;
         if(si<CHAIN_STEPS-1){
             float wh_prob=0.02f;
             if(cd>0.3f) wh_prob+=((cd-0.3f)/0.7f)*0.15f;
-            wormhole=((float)rand()/RAND_MAX)<wh_prob;
+            wh_prob=clampf(wh_prob+vel.wormhole_bonus,0,0.3f);
+            int boundary_ok=(best_ol>10&&best_sc>(0.22f+0.18f*phase_gate));
+            wormhole=boundary_ok&&(((float)rand()/RAND_MAX)<wh_prob);
             if(wormhole&&itf&&itf->n_docs>0){
                 const InterferenceDoc *doc=&itf->docs[0];
                 for(int di=1;di<itf->n_docs;di++) if(itf->docs[di].n_heavy>doc->n_heavy) doc=&itf->docs[di];
                 if(doc->n_heavy>0){
-                    int wh_prompt[1]={doc->heavy[rand()%doc->n_heavy]};
+                    int wh_prompt[4];
+                    int wh_len=0;
+                    int start=best_ol>3?best_ol-3:0;
+                    for(int i=start;i<best_ol&&wh_len<3;i++) wh_prompt[wh_len++]=best_out[i];
+                    wh_prompt[wh_len++]=doc->heavy[rand()%doc->n_heavy];
                     dir=dir!=0?-dir:1;
-                    best_ol=gen_sent(t,bpe,mw,wh_prompt,1,has_weights?0.55f:0.7f,best_out,256,parl,gdest,ch);
-                    best_sc=coherence_score(mw,best_out,best_ol,t->V);
+                    best_ol=gen_sent(t,bpe,mw,wh_prompt,wh_len,has_weights?0.55f:0.7f,best_out,256,parl,gdest,ch,&vel,doc_signal);
+                    best_sc=coherence_score(mw,best_out,best_ol,t->V)+0.6f*surface_coherence_score(bpe,best_out,best_ol);
+                    if(best_sc<0.15f) ch->debt=clampf(ch->debt+0.04f,0,1);
+                    else ch->debt=clampf(ch->debt*0.97f,0,1);
+                    qexp_add_wormhole(si,best_sc>=0.15f,best_sc,ch->debt);
                 }
             }
         }
@@ -1045,18 +1659,24 @@ static void gen_chain(TF *t, const BPE *bpe, MetaW *mw, Chambers *ch,
         if(best_ol<5||(best_sc<0.01f&&best_ol<8)){
             printf("[...]\n");
         }else{
-            char buf[128],textbuf[512]={0};int printed=0,pos=0;
-            for(int i=0;i<best_ol&&printed<200;i++){int len=bpe_decode_token(bpe,best_out[i],buf,sizeof(buf));if(len>0){printf("%s",buf);printed+=len; if(pos+len<(int)sizeof(textbuf)-1){memcpy(textbuf+pos,buf,len);pos+=len;textbuf[pos]=0;}}}
+            char buf[128],textbuf[512]={0};int printed=0,pos=0,start_idx=display_start_index(bpe,best_out,best_ol);
+            for(int i=start_idx;i<best_ol&&printed<200;i++){int len=bpe_decode_token(bpe,best_out[i],buf,sizeof(buf));if(len>0){printf("%s",buf);printed+=len; if(pos+len<(int)sizeof(textbuf)-1){memcpy(textbuf+pos,buf,len);pos+=len;textbuf[pos]=0;}}}
             if(used_interf) printf("  {interf}");
             if(wormhole) printf("  {wormhole}");
             printf("\n");
             ch_feel_text(ch,textbuf,pt);
             int text_ids[256]; int text_n=bpe_encode(bpe,(const uint8_t*)textbuf,(int)strlen(textbuf),text_ids,256);
             ingest_ids(mw,text_ids,text_n,0.005f);
+            {float surface=surface_coherence_score(bpe,best_out,best_ol);
+            float local_phase=clampf(0.50f+0.25f*best_sc+0.04f*surface,0,1);
+            float chunk_res=active_chunk?((float)active_chunk->n_heavy/16.0f):0.0f;
+            phase_gate=update_phase_state(ch,local_phase,coherence_env_pressure(ch,cd,prophecy_pressure(mw),chunk_res));}
         }
         /* save for SPA */
         chain_lens[si]=best_ol; memcpy(chain_ids[si],best_out,best_ol*sizeof(int));
-        ch_xfire(ch,3); ch->debt=0.9f*ch->debt+0.05f;
+        qexp_add_prophecy(si,prophecy_pressure(mw),ch->debt);
+        if(parl){ float av=0; for(int i=0;i<parl->n;i++) av+=parl->ex[i].vitality; av/=(parl->n>0?parl->n:1); qexp_add_parliament(si,parl->n,parl->n_winners,parl->last_diversity,av,parl->last_births,parl->last_deaths,parl->last_consolidations); }
+        ch_xfire(ch,3); ch->debt=0.9f*ch->debt+0.05f; if(doc_signal) free(doc_signal);
     }
     /* SPA: iterative cross-attention — reseed weak sentences, verify improvement */
     float spa_embs[CHAIN_STEPS][SPA_DIM]; float spa_scores[CHAIN_STEPS];
@@ -1067,15 +1687,16 @@ static void gen_chain(TF *t, const BPE *bpe, MetaW *mw, Chambers *ch,
         float min_sc=spa_scores[0];int weak_idx=0;
         for(int i=1;i<CHAIN_STEPS;i++) if(spa_scores[i]<min_sc){min_sc=spa_scores[i];weak_idx=i;}
         float avg_sc=0;for(int i=0;i<CHAIN_STEPS;i++) avg_sc+=spa_scores[i];avg_sc/=CHAIN_STEPS;
-        if(min_sc<avg_sc*0.6f){ /* slightly more aggressive threshold */
+        float reseed_floor=avg_sc*(0.52f+0.18f*(1.0f-phase_gate));
+        if(min_sc<reseed_floor){
             printf("  [SPA-%d] reseeding step %d (score=%.2f, avg=%.2f)\n",spa_pass+1,weak_idx+1,min_sc,avg_sc);
             /* use neighbor sentences as context for better continuity */
             int seed_src=weak_idx>0?weak_idx-1:(weak_idx<CHAIN_STEPS-1?weak_idx+1:0);
             int nprom=chain_lens[seed_src]>3?3:chain_lens[seed_src];
             int prompt[5]; for(int i=0;i<nprom;i++) prompt[i]=chain_ids[seed_src][chain_lens[seed_src]-nprom+i];
-            int out[256],ol=gen_sent(t,bpe,mw,prompt,nprom,has_weights?0.55f:0.7f,out,256,parl,gdest,ch);
-            float new_sc=coherence_score(mw,out,ol,t->V);
-            float old_sc=coherence_score(mw,chain_ids[weak_idx],chain_lens[weak_idx],t->V);
+            int out[256],ol=gen_sent(t,bpe,mw,prompt,nprom,has_weights?0.55f:0.7f,out,256,parl,gdest,ch,&vel,NULL);
+            float new_sc=coherence_score(mw,out,ol,t->V)+0.6f*surface_coherence_score(bpe,out,ol);
+            float old_sc=coherence_score(mw,chain_ids[weak_idx],chain_lens[weak_idx],t->V)+0.6f*surface_coherence_score(bpe,chain_ids[weak_idx],chain_lens[weak_idx]);
             if(new_sc>old_sc*0.7f||ol>chain_lens[weak_idx]){ /* accept if reasonable */
                 chain_lens[weak_idx]=ol; memcpy(chain_ids[weak_idx],out,ol*sizeof(int));
                 printf("  [%2d] + ",weak_idx+1);
@@ -1087,6 +1708,7 @@ static void gen_chain(TF *t, const BPE *bpe, MetaW *mw, Chambers *ch,
                 for(int i=0;i<ol;i++){char b[128];int len=bpe_decode_token(bpe,out[i],b,sizeof(b));if(len>0&&pos+len<511){memcpy(textbuf+pos,b,len);pos+=len;}}
                 textbuf[pos]=0; ch_feel_text(ch,textbuf,pt);
                 ingest_ids(mw,out,ol,0.003f);
+                phase_gate=update_phase_state(ch,clampf(0.48f+0.22f*new_sc,0,1),coherence_env_pressure(ch,cd,prophecy_pressure(mw),0));
             }
         }else break; /* no weak sentences, stop iterating */
     }
@@ -1096,6 +1718,212 @@ static void gen_chain(TF *t, const BPE *bpe, MetaW *mw, Chambers *ch,
 }
 
 /* ── main ── */
+static void qsqlite_escape(const char *in, char *out, size_t out_sz){
+    size_t w=0;
+    for(size_t i=0;in[i]&&w+2<out_sz;i++){
+        if(in[i]=='\'') out[w++]='\'';
+        out[w++]=in[i];
+    }
+    out[w]=0;
+}
+
+static int qsqlite_load(MetaW *mw, const char *path, PeriodicTable *pt, Chambers *ch){
+    if(access(path,F_OK)!=0) return 0;
+    char cmd[512], line[512];
+    FILE *fp;
+    snprintf(cmd,sizeof(cmd),"sqlite3 -tabs -noheader '%s' \"SELECT a,b,prob FROM bigrams;\"",path);
+    fp=popen(cmd,"r"); if(!fp) return 0;
+    while(fgets(line,sizeof(line),fp)){
+        int a,b; float p;
+        if(sscanf(line,"%d\t%d\t%f",&a,&b,&p)==3){
+            int found=0;
+            for(int j=0;j<mw->n_bi;j++) if(mw->bigrams[j].a==a&&mw->bigrams[j].b==b){ if(p>mw->bigrams[j].prob) mw->bigrams[j].prob=p; found=1; break; }
+            if(!found&&mw->n_bi<MAX_BIGRAM){mw->bigrams[mw->n_bi].a=a;mw->bigrams[mw->n_bi].b=b;mw->bigrams[mw->n_bi].prob=p;mw->n_bi++;}
+        }
+    }
+    pclose(fp);
+    snprintf(cmd,sizeof(cmd),"sqlite3 -tabs -noheader '%s' \"SELECT a,b,c,prob FROM trigrams;\"",path);
+    fp=popen(cmd,"r"); if(!fp) return 0;
+    while(fgets(line,sizeof(line),fp)){
+        int a,b,c; float p;
+        if(sscanf(line,"%d\t%d\t%d\t%f",&a,&b,&c,&p)==4 && mw->n_tri<MAX_TRIGRAM){mw->trigrams[mw->n_tri].a=a;mw->trigrams[mw->n_tri].b=b;mw->trigrams[mw->n_tri].c=c;mw->trigrams[mw->n_tri].prob=p;mw->n_tri++;}
+    }
+    pclose(fp);
+    snprintf(cmd,sizeof(cmd),"sqlite3 -tabs -noheader '%s' \"SELECT a,b,strength FROM hebb;\"",path);
+    fp=popen(cmd,"r"); if(!fp) return 0;
+    while(fgets(line,sizeof(line),fp)){
+        int a,b; float p;
+        if(sscanf(line,"%d\t%d\t%f",&a,&b,&p)==3 && mw->n_hebb<MAX_HEBBIAN){mw->hebbs[mw->n_hebb].a=a;mw->hebbs[mw->n_hebb].b=b;mw->hebbs[mw->n_hebb].str=p;mw->n_hebb++;}
+    }
+    pclose(fp);
+    snprintf(cmd,sizeof(cmd),"sqlite3 -tabs -noheader '%s' \"SELECT target,strength,age FROM prophecies ORDER BY age DESC LIMIT %d;\"",path,MAX_PROPHECY);
+    fp=popen(cmd,"r"); if(!fp) return 0;
+    while(fgets(line,sizeof(line),fp)){
+        int target,age; float strength;
+        if(sscanf(line,"%d\t%f\t%d",&target,&strength,&age)==3 && mw->n_prophecy<MAX_PROPHECY) mw->prophecies[mw->n_prophecy++] = (ProphecyE){target,strength,age};
+    }
+    pclose(fp);
+    snprintf(cmd,sizeof(cmd),"sqlite3 -tabs -noheader '%s' \"SELECT word,chamber,mass FROM periodic_elements;\"",path);
+    fp=popen(cmd,"r"); if(!fp) return 0;
+    while(fgets(line,sizeof(line),fp)){
+        char *word=strtok(line,"\t\r\n"), *chamber_s=strtok(NULL,"\t\r\n"), *mass_s=strtok(NULL,"\t\r\n");
+        if(word&&chamber_s&&mass_s) periodic_add(pt,word,atoi(chamber_s),atof(mass_s));
+    }
+    pclose(fp);
+    snprintf(cmd,sizeof(cmd),"sqlite3 -tabs -noheader '%s' \"SELECT presence,debt,trauma,soma0,soma1,soma2,soma3,soma4,soma5 FROM chambers WHERE id=1;\"",path);
+    fp=popen(cmd,"r"); if(!fp) return 0;
+    if(fgets(line,sizeof(line),fp)){
+        float vals[9]={0};
+        if(sscanf(line,"%f\t%f\t%f\t%f\t%f\t%f\t%f\t%f\t%f",&vals[0],&vals[1],&vals[2],&vals[3],&vals[4],&vals[5],&vals[6],&vals[7],&vals[8])==9){
+            ch->presence=clampf(vals[0],0,1); ch->debt=clampf(vals[1],0,1); ch->trauma=clampf(vals[2],0,1);
+            for(int i=0;i<6;i++){ ch->soma[i]=clampf(vals[3+i],0,1); ch->act[i]=clampf(ch->act[i]>0.25f*ch->soma[i]?ch->act[i]:0.25f*ch->soma[i],0,1); }
+        }
+    }
+    pclose(fp);
+    snprintf(cmd,sizeof(cmd),"sqlite3 -tabs -noheader '%s' \"SELECT value FROM meta WHERE key='scar';\"",path);
+    fp=popen(cmd,"r"); if(!fp) return 0;
+    if(fgets(line,sizeof(line),fp)) ch->scar=clampf(atof(line),0,1);
+    pclose(fp);
+    snprintf(cmd,sizeof(cmd),"sqlite3 -tabs -noheader '%s' \"SELECT value FROM meta WHERE key='coherence_state';\"",path);
+    fp=popen(cmd,"r"); if(!fp) return 0;
+    if(fgets(line,sizeof(line),fp)) ch->coherence=clampf(atof(line),0,1);
+    pclose(fp);
+    snprintf(cmd,sizeof(cmd),"sqlite3 -tabs -noheader '%s' \"SELECT value FROM meta WHERE key='phase_lock';\"",path);
+    fp=popen(cmd,"r"); if(!fp) return 0;
+    if(fgets(line,sizeof(line),fp)) ch->phase_lock=clampf(atof(line),0,1);
+    pclose(fp);
+    snprintf(cmd,sizeof(cmd),"sqlite3 -tabs -noheader '%s' \"SELECT value FROM meta WHERE key='threshold_bias';\"",path);
+    fp=popen(cmd,"r"); if(!fp) return 0;
+    if(fgets(line,sizeof(line),fp)) ch->threshold_bias=clampf(atof(line),0,1);
+    pclose(fp);
+    snprintf(cmd,sizeof(cmd),"sqlite3 -tabs -noheader '%s' \"SELECT scar FROM scar_events ORDER BY id DESC LIMIT 8;\"",path);
+    fp=popen(cmd,"r"); if(!fp) return 0;
+    {float sum=0; int n=0; while(fgets(line,sizeof(line),fp)){ sum+=atof(line); n++; }
+    if(n>0){ float scar_res=sum/n; ch->scar=clampf(ch->scar>0.7f*scar_res?ch->scar:0.7f*scar_res,0,1); ch->trauma=clampf(ch->trauma>0.45f*scar_res?ch->trauma:0.45f*scar_res,0,1); }}
+    pclose(fp);
+    snprintf(cmd,sizeof(cmd),"sqlite3 -tabs -noheader '%s' \"SELECT success,debt FROM wormhole_events ORDER BY id DESC LIMIT 8;\"",path);
+    fp=popen(cmd,"r"); if(!fp) return 0;
+    {float fail_sum=0,debt_sum=0; int n=0; while(fgets(line,sizeof(line),fp)){ int success=0; float debt=0; if(sscanf(line,"%d\t%f",&success,&debt)==2){ fail_sum+=success?0.0f:1.0f; debt_sum+=debt; n++; } }
+    if(n>0){ float fail_ratio=fail_sum/n, avg_debt=debt_sum/n; float target=0.55f*avg_debt+0.10f*fail_ratio; ch->debt=clampf(ch->debt>target?ch->debt:target,0,1); }}
+    pclose(fp);
+    snprintf(cmd,sizeof(cmd),"sqlite3 -tabs -noheader '%s' \"SELECT pressure,debt FROM prophecy_events ORDER BY id DESC LIMIT 12;\"",path);
+    fp=popen(cmd,"r"); if(!fp) return 0;
+    {float p_sum=0,debt_sum=0; int n=0; while(fgets(line,sizeof(line),fp)){ float pressure=0,debt=0; if(sscanf(line,"%f\t%f",&pressure,&debt)==2){ p_sum+=pressure; debt_sum+=debt; n++; } }
+    if(n>0){ float target=0.45f*(p_sum/n)+0.35f*(debt_sum/n); ch->debt=clampf(ch->debt>target?ch->debt:target,0,1); }}
+    pclose(fp);
+    snprintf(cmd,sizeof(cmd),"sqlite3 -tabs -noheader '%s' \"SELECT flow,fear,void,complexity FROM phase_events ORDER BY id DESC LIMIT 12;\"",path);
+    fp=popen(cmd,"r"); if(!fp) return 0;
+    {float flow=0,fear=0,voidv=0,complexity=0; int n=0; while(fgets(line,sizeof(line),fp)){ float a=0,b=0,c=0,d=0; if(sscanf(line,"%f\t%f\t%f\t%f",&a,&b,&c,&d)==4){ flow+=a; fear+=b; voidv+=c; complexity+=d; n++; } }
+    if(n>0){ flow/=n; fear/=n; voidv/=n; complexity/=n; ch->act[CH_FLOW]=clampf(ch->act[CH_FLOW]>flow?ch->act[CH_FLOW]:flow,0,1); ch->act[CH_FEAR]=clampf(ch->act[CH_FEAR]>fear?ch->act[CH_FEAR]:fear,0,1); ch->act[CH_VOID]=clampf(ch->act[CH_VOID]>voidv?ch->act[CH_VOID]:voidv,0,1); ch->act[CH_CMPLX]=clampf(ch->act[CH_CMPLX]>complexity?ch->act[CH_CMPLX]:complexity,0,1); }}
+    pclose(fp);
+    snprintf(cmd,sizeof(cmd),"sqlite3 -tabs -noheader '%s' \"SELECT resonance FROM chunk_events ORDER BY id DESC LIMIT 12;\"",path);
+    fp=popen(cmd,"r"); if(!fp) return 0;
+    {float sum=0; int n=0; while(fgets(line,sizeof(line),fp)){ sum+=atof(line); n++; }
+    if(n>0){ float avg=sum/n; float complex_t=0.04f*avg, flow_t=0.03f*avg; ch->act[CH_CMPLX]=clampf(ch->act[CH_CMPLX]>complex_t?ch->act[CH_CMPLX]:complex_t,0,1); ch->act[CH_FLOW]=clampf(ch->act[CH_FLOW]>flow_t?ch->act[CH_FLOW]:flow_t,0,1); }}
+    pclose(fp);
+    snprintf(cmd,sizeof(cmd),"sqlite3 -tabs -noheader '%s' \"SELECT diversity,avg_vitality,consolidations FROM parliament_events ORDER BY id DESC LIMIT 12;\"",path);
+    fp=popen(cmd,"r"); if(!fp) return 0;
+    {float sum_div=0,sum_vit=0,sum_cons=0; int n=0; while(fgets(line,sizeof(line),fp)){ float div=0,vit=0,cons=0; if(sscanf(line,"%f\t%f\t%f",&div,&vit,&cons)==3){ sum_div+=div; sum_vit+=vit; sum_cons+=cons; n++; }}
+    if(n>0){ float avg_div=sum_div/n, avg_vit=sum_vit/n, avg_cons=sum_cons/n; ch->presence=clampf(ch->presence>(0.22f*avg_vit+0.04f*avg_cons)?ch->presence:(0.22f*avg_vit+0.04f*avg_cons),0,1); ch->act[CH_CMPLX]=clampf(ch->act[CH_CMPLX]>(0.18f*avg_div+0.03f*avg_cons)?ch->act[CH_CMPLX]:(0.18f*avg_div+0.03f*avg_cons),0,1); ch->act[CH_FLOW]=clampf(ch->act[CH_FLOW]>(0.12f*avg_vit)?ch->act[CH_FLOW]:(0.12f*avg_vit),0,1); ch->phase_lock=clampf(ch->phase_lock>(0.16f*avg_div+0.12f*avg_cons)?ch->phase_lock:(0.16f*avg_div+0.12f*avg_cons),0,1); }}
+    pclose(fp);
+    return 1;
+}
+
+static int qsqlite_save(const MetaW *mw, const char *path, const PeriodicTable *pt, const Chambers *ch){
+    char tpl[]="/tmp/q_sqlite_XXXXXX.sql";
+    int fd=mkstemps(tpl,4); if(fd<0) return 0;
+    FILE *sf=fdopen(fd,"w"); if(!sf){ close(fd); return 0; }
+    fprintf(sf,
+        "BEGIN;\n"
+        "CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);\n"
+        "CREATE TABLE IF NOT EXISTS bigrams(a INTEGER,b INTEGER,prob REAL,PRIMARY KEY(a,b));\n"
+        "CREATE TABLE IF NOT EXISTS trigrams(a INTEGER,b INTEGER,c INTEGER,prob REAL,PRIMARY KEY(a,b,c));\n"
+        "CREATE TABLE IF NOT EXISTS hebb(a INTEGER,b INTEGER,strength REAL,PRIMARY KEY(a,b));\n"
+        "CREATE TABLE IF NOT EXISTS prophecies(target INTEGER PRIMARY KEY,strength REAL,age INTEGER);\n"
+        "CREATE TABLE IF NOT EXISTS periodic_elements(word TEXT PRIMARY KEY,chamber INTEGER,mass REAL);\n"
+        "CREATE TABLE IF NOT EXISTS chambers(id INTEGER PRIMARY KEY CHECK(id=1),presence REAL,debt REAL,trauma REAL,soma0 REAL,soma1 REAL,soma2 REAL,soma3 REAL,soma4 REAL,soma5 REAL);\n"
+        "CREATE TABLE IF NOT EXISTS episodes(id INTEGER PRIMARY KEY AUTOINCREMENT,kind TEXT,payload TEXT,created_at TEXT DEFAULT CURRENT_TIMESTAMP);\n"
+        "CREATE TABLE IF NOT EXISTS scar_events(id INTEGER PRIMARY KEY AUTOINCREMENT,episode_id INTEGER NOT NULL,step INTEGER NOT NULL,scar REAL NOT NULL,note TEXT,created_at TEXT DEFAULT CURRENT_TIMESTAMP);\n"
+        "CREATE TABLE IF NOT EXISTS wormhole_events(id INTEGER PRIMARY KEY AUTOINCREMENT,episode_id INTEGER NOT NULL,step INTEGER NOT NULL,success INTEGER NOT NULL,coherence REAL NOT NULL,debt REAL NOT NULL,created_at TEXT DEFAULT CURRENT_TIMESTAMP);\n"
+        "CREATE TABLE IF NOT EXISTS prophecy_events(id INTEGER PRIMARY KEY AUTOINCREMENT,episode_id INTEGER NOT NULL,step INTEGER NOT NULL,pressure REAL NOT NULL,debt REAL NOT NULL,created_at TEXT DEFAULT CURRENT_TIMESTAMP);\n"
+        "CREATE TABLE IF NOT EXISTS phase_events(id INTEGER PRIMARY KEY AUTOINCREMENT,episode_id INTEGER NOT NULL,step INTEGER NOT NULL,phase TEXT NOT NULL,flow REAL NOT NULL,fear REAL NOT NULL,void REAL NOT NULL,complexity REAL NOT NULL,created_at TEXT DEFAULT CURRENT_TIMESTAMP);\n"
+        "CREATE TABLE IF NOT EXISTS chunk_events(id INTEGER PRIMARY KEY AUTOINCREMENT,episode_id INTEGER NOT NULL,step INTEGER NOT NULL,doc_name TEXT,chunk_start INTEGER NOT NULL,resonance REAL NOT NULL,created_at TEXT DEFAULT CURRENT_TIMESTAMP);\n"
+        "CREATE TABLE IF NOT EXISTS parliament_events(id INTEGER PRIMARY KEY AUTOINCREMENT,episode_id INTEGER NOT NULL,step INTEGER NOT NULL,experts INTEGER NOT NULL,winners INTEGER NOT NULL,diversity REAL NOT NULL,avg_vitality REAL NOT NULL,births INTEGER NOT NULL,deaths INTEGER NOT NULL,consolidations INTEGER NOT NULL,created_at TEXT DEFAULT CURRENT_TIMESTAMP);\n"
+        "INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version','1');\n"
+        "DELETE FROM bigrams;DELETE FROM trigrams;DELETE FROM hebb;DELETE FROM prophecies;DELETE FROM periodic_elements;DELETE FROM chambers;\n");
+    for(int i=0;i<mw->n_bi;i++) fprintf(sf,"INSERT INTO bigrams(a,b,prob) VALUES(%d,%d,%.9g);\n",mw->bigrams[i].a,mw->bigrams[i].b,mw->bigrams[i].prob);
+    for(int i=0;i<mw->n_tri;i++) fprintf(sf,"INSERT INTO trigrams(a,b,c,prob) VALUES(%d,%d,%d,%.9g);\n",mw->trigrams[i].a,mw->trigrams[i].b,mw->trigrams[i].c,mw->trigrams[i].prob);
+    for(int i=0;i<mw->n_hebb;i++) fprintf(sf,"INSERT INTO hebb(a,b,strength) VALUES(%d,%d,%.9g);\n",mw->hebbs[i].a,mw->hebbs[i].b,mw->hebbs[i].str);
+    for(int i=0;i<mw->n_prophecy;i++) fprintf(sf,"INSERT INTO prophecies(target,strength,age) VALUES(%d,%.9g,%d);\n",mw->prophecies[i].target,mw->prophecies[i].strength,mw->prophecies[i].age);
+    for(int i=0;i<pt->n;i++){ char esc[96]; qsqlite_escape(pt->elements[i].word,esc,sizeof(esc)); fprintf(sf,"INSERT INTO periodic_elements(word,chamber,mass) VALUES('%s',%d,%.9g);\n",esc,pt->elements[i].chamber,pt->elements[i].mass); }
+    fprintf(sf,"INSERT OR REPLACE INTO meta(key,value) VALUES('scar','%.9g');\n",ch->scar);
+    fprintf(sf,"INSERT OR REPLACE INTO meta(key,value) VALUES('coherence_state','%.9g');\n",clampf(ch->coherence,0,1));
+    fprintf(sf,"INSERT OR REPLACE INTO meta(key,value) VALUES('phase_lock','%.9g');\n",clampf(ch->phase_lock,0,1));
+    fprintf(sf,"INSERT OR REPLACE INTO meta(key,value) VALUES('threshold_bias','%.9g');\n",clampf(ch->threshold_bias,0,1));
+    fprintf(sf,"INSERT INTO chambers(id,presence,debt,trauma,soma0,soma1,soma2,soma3,soma4,soma5) VALUES(1,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g);\n",
+        ch->presence,ch->debt,ch->trauma,ch->soma[0],ch->soma[1],ch->soma[2],ch->soma[3],ch->soma[4],ch->soma[5]);
+    fprintf(sf,"INSERT INTO episodes(kind,payload) VALUES('snapshot','bi=%d;tri=%d;hebb=%d;prophecy=%d');\n",mw->n_bi,mw->n_tri,mw->n_hebb,mw->n_prophecy);
+    for(int i=0;i<QEXP.n_scars;i++){ char note[64]; qsqlite_escape(QEXP.scars[i].note,note,sizeof(note)); fprintf(sf,"INSERT INTO scar_events(episode_id,step,scar,note) VALUES((SELECT MAX(id) FROM episodes),%d,%.9g,'%s');\n",QEXP.scars[i].step,QEXP.scars[i].scar,note); }
+    for(int i=0;i<QEXP.n_wormholes;i++) fprintf(sf,"INSERT INTO wormhole_events(episode_id,step,success,coherence,debt) VALUES((SELECT MAX(id) FROM episodes),%d,%d,%.9g,%.9g);\n",QEXP.wormholes[i].step,QEXP.wormholes[i].success,QEXP.wormholes[i].coherence,QEXP.wormholes[i].debt);
+    for(int i=0;i<QEXP.n_prophecies;i++) fprintf(sf,"INSERT INTO prophecy_events(episode_id,step,pressure,debt) VALUES((SELECT MAX(id) FROM episodes),%d,%.9g,%.9g);\n",QEXP.prophecies[i].step,QEXP.prophecies[i].pressure,QEXP.prophecies[i].debt);
+    for(int i=0;i<QEXP.n_phases;i++){ char phase[32]; qsqlite_escape(QEXP.phases[i].phase,phase,sizeof(phase)); fprintf(sf,"INSERT INTO phase_events(episode_id,step,phase,flow,fear,void,complexity) VALUES((SELECT MAX(id) FROM episodes),%d,'%s',%.9g,%.9g,%.9g,%.9g);\n",QEXP.phases[i].step,phase,QEXP.phases[i].flow,QEXP.phases[i].fear,QEXP.phases[i].voidv,QEXP.phases[i].complexity); }
+    for(int i=0;i<QEXP.n_chunks;i++){ char doc[96]; qsqlite_escape(QEXP.chunks[i].doc_name,doc,sizeof(doc)); fprintf(sf,"INSERT INTO chunk_events(episode_id,step,doc_name,chunk_start,resonance) VALUES((SELECT MAX(id) FROM episodes),%d,'%s',%d,%.9g);\n",QEXP.chunks[i].step,doc,QEXP.chunks[i].chunk_start,QEXP.chunks[i].resonance); }
+    for(int i=0;i<QEXP.n_parliament;i++) fprintf(sf,"INSERT INTO parliament_events(episode_id,step,experts,winners,diversity,avg_vitality,births,deaths,consolidations) VALUES((SELECT MAX(id) FROM episodes),%d,%d,%d,%.9g,%.9g,%d,%d,%d);\n",QEXP.parliament[i].step,QEXP.parliament[i].experts,QEXP.parliament[i].winners,QEXP.parliament[i].diversity,QEXP.parliament[i].avg_vitality,QEXP.parliament[i].births,QEXP.parliament[i].deaths,QEXP.parliament[i].consolidations);
+    fprintf(sf,"COMMIT;\n");
+    fclose(sf);
+    char cmd[768];
+    snprintf(cmd,sizeof(cmd),"sqlite3 '%s' < '%s' >/dev/null 2>&1",path,tpl);
+    int ok=system(cmd)==0;
+    unlink(tpl);
+    return ok;
+}
+
+#define QSPORE_MAGIC 0x51535052u
+#define QSPORE_VERSION 1u
+static int qspore_save(const MetaW *mw, const char *path, const PeriodicTable *pt, const Chambers *ch){
+    const char *slash = strrchr(path,'/');
+    if(slash){
+        char dir[256];
+        size_t n=(size_t)(slash-path);
+        if(n>=sizeof(dir)) n=sizeof(dir)-1;
+        memcpy(dir,path,n);
+        dir[n]='\0';
+        mkdir(dir,0755);
+    }
+    FILE *f=fopen(path,"wb"); if(!f) return 0;
+    uint32_t magic=QSPORE_MAGIC, ver=QSPORE_VERSION;
+    fwrite(&magic,4,1,f); fwrite(&ver,4,1,f);
+    fwrite(ch->act,sizeof(float),6,f);
+    fwrite(ch->soma,sizeof(float),6,f);
+    fwrite(&ch->presence,4,1,f); fwrite(&ch->debt,4,1,f); fwrite(&ch->trauma,4,1,f); fwrite(&ch->scar,4,1,f);
+    uint32_t np=(uint32_t)(mw->n_prophecy<16?mw->n_prophecy:16); fwrite(&np,4,1,f);
+    for(uint32_t i=0;i<np;i++){ fwrite(&mw->prophecies[i].target,4,1,f); fwrite(&mw->prophecies[i].strength,4,1,f); fwrite(&mw->prophecies[i].age,4,1,f); }
+    uint32_t ne=(uint32_t)(pt->n<32?pt->n:32); fwrite(&ne,4,1,f);
+    for(uint32_t i=0;i<ne;i++){
+        uint8_t wlen=(uint8_t)strlen(pt->elements[i].word);
+        fwrite(&wlen,1,1,f); fwrite(pt->elements[i].word,1,wlen,f);
+        uint8_t chamber=(uint8_t)pt->elements[i].chamber; fwrite(&chamber,1,1,f); fwrite(&pt->elements[i].mass,4,1,f);
+    }
+    fclose(f); return 1;
+}
+static int qspore_load(MetaW *mw, const char *path, PeriodicTable *pt, Chambers *ch){
+    FILE *f=fopen(path,"rb"); if(!f) return 0;
+    uint32_t magic=0, ver=0; if(fread(&magic,4,1,f)!=1||fread(&ver,4,1,f)!=1||magic!=QSPORE_MAGIC||ver!=QSPORE_VERSION){ fclose(f); return 0; }
+    float act[6]={0}, soma[6]={0}, presence=0,debt=0,trauma=0,scar=0;
+    if(fread(act,sizeof(float),6,f)!=6||fread(soma,sizeof(float),6,f)!=6){ fclose(f); return 0; }
+    fread(&presence,4,1,f); fread(&debt,4,1,f); fread(&trauma,4,1,f); fread(&scar,4,1,f);
+    for(int i=0;i<6;i++){ ch->act[i]=clampf(ch->act[i]>(0.55f*act[i])?ch->act[i]:(0.55f*act[i]),0,1); ch->soma[i]=clampf(ch->soma[i]>(0.60f*soma[i])?ch->soma[i]:(0.60f*soma[i]),0,1); }
+    ch->presence=clampf(ch->presence>(0.70f*presence)?ch->presence:(0.70f*presence),0,1);
+    ch->debt=clampf(ch->debt>(0.55f*debt)?ch->debt:(0.55f*debt),0,1);
+    ch->trauma=clampf(ch->trauma>(0.55f*trauma)?ch->trauma:(0.55f*trauma),0,1);
+    ch->scar=clampf(ch->scar>(0.60f*scar)?ch->scar:(0.60f*scar),0,1);
+    uint32_t np=0; fread(&np,4,1,f);
+    for(uint32_t i=0;i<np&&i<16;i++){ int target=0,age=0; float strength=0; fread(&target,4,1,f); fread(&strength,4,1,f); fread(&age,4,1,f); prophecy_add(mw,target,0.65f*strength); if(mw->n_prophecy>0) mw->prophecies[mw->n_prophecy-1].age = mw->prophecies[mw->n_prophecy-1].age>age?mw->prophecies[mw->n_prophecy-1].age:age; }
+    uint32_t ne=0; fread(&ne,4,1,f);
+    for(uint32_t i=0;i<ne&&i<32;i++){ uint8_t wlen=0,chamber=0; char w[32]={0}; float mass=0; fread(&wlen,1,1,f); if(wlen>31)wlen=31; fread(w,1,wlen,f); fread(&chamber,1,1,f); fread(&mass,4,1,f); if(chamber<6) periodic_add(pt,w,(int)chamber,0.65f*clampf(mass,0,1)); }
+    fclose(f); return 1;
+}
+
 int main(int argc, char **argv){
     printf("PostGPT-Q — Resonant Reasoning Engine (C)\ntheta = epsilon + gamma + alpha*delta\nresonance is unbreakable.\n\n");
     if(argc<3){printf("Usage: %s [weights.bin] corpus.merges corpus.txt\n",argv[0]);return 1;}
@@ -1148,7 +1976,10 @@ int main(int argc, char **argv){
     Chambers ch; ch_init(&ch);
 
     /* try loading saved memory */
-    {FILE *mf=fopen("q.memory","rb");
+    if(qsqlite_load(mw,"q.sqlite",&pt,&ch)){
+        printf("  [memory loaded: %d bi, %d tri, %d hebb from q.sqlite]\n",mw->n_bi,mw->n_tri,mw->n_hebb);
+        if(pt.n>0) printf("  [periodic: %d elements loaded]\n",pt.n);
+    } else {FILE *mf=fopen("q.memory","rb");
     if(mf){
         uint32_t magic;fread(&magic,4,1,mf);
         if(magic==0x514D454D){
@@ -1190,6 +2021,13 @@ int main(int argc, char **argv){
                 fread(&ch.presence,4,1,mf);
                 fread(&ch.debt,4,1,mf);
                 fread(&ch.trauma,4,1,mf);
+                fread(&ch.scar,4,1,mf);
+                {float phase_extra[3]={0};
+                if(fread(phase_extra,sizeof(float),3,mf)==3){
+                    ch.coherence=clampf(phase_extra[0],0,1);
+                    ch.phase_lock=clampf(phase_extra[1],0,1);
+                    ch.threshold_bias=clampf(phase_extra[2],0,1);
+                }}
                 for(int i=0;i<6;i++){
                     ch.soma[i]=clampf(ch.soma[i],0,1);
                     ch.act[i]=clampf(ch.act[i]>0.25f*ch.soma[i]?ch.act[i]:0.25f*ch.soma[i],0,1);
@@ -1197,10 +2035,13 @@ int main(int argc, char **argv){
                 ch.presence=clampf(ch.presence,0,1);
                 ch.debt=clampf(ch.debt,0,1);
                 ch.trauma=clampf(ch.trauma,0,1);
+                ch.scar=clampf(ch.scar,0,1);
             }}
         }
         fclose(mf);
     }}
+    {const char *spore_path="spores/q.spore.bin";
+    if(qspore_load(mw,spore_path,&pt,&ch)) printf("  [spore loaded: %s]\n",spore_path);}
 
     printf("[5] DOE Parliament...\n");
     Parliament parl; parl_init(&parl,t.D,4);
@@ -1221,6 +2062,8 @@ int main(int argc, char **argv){
         gen_chain(&t,&bpe,mw,&ch,cids,clen,has_weights,&parl,&pt,&itf,input);
     }
     /* save evolved MetaWeights — Q remembers between sessions */
+    consolidate_experience(mw,&pt,&ch);
+    qsqlite_save(mw,"q.sqlite",&pt,&ch);
     {FILE *mf=fopen("q.memory","wb");
     if(mf){
         uint32_t magic=0x514D454D; /* QMEM */
@@ -1242,8 +2085,13 @@ int main(int argc, char **argv){
         fwrite(ch.soma,sizeof(float),6,mf);
         fwrite(&ch.presence,4,1,mf);
         fwrite(&ch.debt,4,1,mf);
-        fwrite(&ch.trauma,4,1,mf);}
-        fclose(mf);printf("  [memory saved: %d bi, %d tri, %d hebb, %d periodic → q.memory]\n",mw->n_bi,mw->n_tri,mw->n_hebb,pt.n);
+        fwrite(&ch.trauma,4,1,mf);
+        fwrite(&ch.scar,4,1,mf);
+        fwrite(&ch.coherence,4,1,mf);
+        fwrite(&ch.phase_lock,4,1,mf);
+        fwrite(&ch.threshold_bias,4,1,mf);}
+        {const char *spore_path="spores/q.spore.bin";
+        fclose(mf); qspore_save(mw,spore_path,&pt,&ch); printf("  [memory saved: %d bi, %d tri, %d hebb, %d periodic → q.sqlite + q.memory]\n",mw->n_bi,mw->n_tri,mw->n_hebb,pt.n);}
     }}
     printf("\nresonance is unbreakable.\n");
     free(cids);free(mw);return 0;
