@@ -38,6 +38,14 @@ MAX_PERIODIC = 4096
 QPTQ_MAGIC  = 0x51505451
 QMEM_SOMA   = 0x414D4F53
 QSQL_SCHEMA = 1
+def new_experience_log():
+    return {"scars": [], "wormholes": [], "prophecies": [], "phases": [], "chunks": []}
+def merge_experience_log(dst, src):
+    if dst is None or src is None:
+        return dst
+    for key in ("scars", "wormholes", "prophecies", "phases", "chunks"):
+        dst[key].extend(src.get(key, []))
+    return dst
 SPA_DIM     = 32
 SPA_NH      = 4
 SPA_HD      = SPA_DIM // SPA_NH
@@ -516,6 +524,51 @@ def sqlite_init(conn):
         payload TEXT,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
+    CREATE TABLE IF NOT EXISTS scar_events(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        episode_id INTEGER NOT NULL,
+        step INTEGER NOT NULL,
+        scar REAL NOT NULL,
+        note TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS wormhole_events(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        episode_id INTEGER NOT NULL,
+        step INTEGER NOT NULL,
+        success INTEGER NOT NULL,
+        coherence REAL NOT NULL,
+        debt REAL NOT NULL,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS prophecy_events(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        episode_id INTEGER NOT NULL,
+        step INTEGER NOT NULL,
+        pressure REAL NOT NULL,
+        debt REAL NOT NULL,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS phase_events(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        episode_id INTEGER NOT NULL,
+        step INTEGER NOT NULL,
+        phase TEXT NOT NULL,
+        flow REAL NOT NULL,
+        fear REAL NOT NULL,
+        void REAL NOT NULL,
+        complexity REAL NOT NULL,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS chunk_events(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        episode_id INTEGER NOT NULL,
+        step INTEGER NOT NULL,
+        doc_name TEXT,
+        chunk_start INTEGER NOT NULL,
+        resonance REAL NOT NULL,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
     """)
     cur.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)", (str(QSQL_SCHEMA),))
     conn.commit()
@@ -564,7 +617,7 @@ def load_memory_sqlite(mw, path, periodic=None, chambers=None):
         return True
     except Exception:
         return False
-def save_memory_sqlite(mw, path, periodic=None, chambers=None):
+def save_memory_sqlite(mw, path, periodic=None, chambers=None, events=None):
     conn = sqlite3.connect(path)
     sqlite_init(conn)
     cur = conn.cursor()
@@ -591,6 +644,28 @@ def save_memory_sqlite(mw, path, periodic=None, chambers=None):
         cur.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('scar',?)", (str(clampf(getattr(chambers, "scar", 0.0), 0.0, 1.0)),))
     cur.execute("INSERT INTO episodes(kind,payload) VALUES('snapshot', ?)",
                 (f"bi={mw.n_bi};tri={mw.n_tri};hebb={mw.n_hebb};prophecy={len(mw.prophecies)}",))
+    episode_id = cur.lastrowid
+    if events is not None:
+        cur.executemany(
+            "INSERT INTO scar_events(episode_id,step,scar,note) VALUES(?,?,?,?)",
+            [(episode_id, ev["step"], ev["scar"], ev.get("note", "")) for ev in events.get("scars", [])]
+        )
+        cur.executemany(
+            "INSERT INTO wormhole_events(episode_id,step,success,coherence,debt) VALUES(?,?,?,?,?)",
+            [(episode_id, ev["step"], 1 if ev.get("success") else 0, ev["coherence"], ev["debt"]) for ev in events.get("wormholes", [])]
+        )
+        cur.executemany(
+            "INSERT INTO prophecy_events(episode_id,step,pressure,debt) VALUES(?,?,?,?)",
+            [(episode_id, ev["step"], ev["pressure"], ev["debt"]) for ev in events.get("prophecies", [])]
+        )
+        cur.executemany(
+            "INSERT INTO phase_events(episode_id,step,phase,flow,fear,void,complexity) VALUES(?,?,?,?,?,?,?)",
+            [(episode_id, ev["step"], ev["phase"], ev["flow"], ev["fear"], ev["void"], ev["complexity"]) for ev in events.get("phases", [])]
+        )
+        cur.executemany(
+            "INSERT INTO chunk_events(episode_id,step,doc_name,chunk_start,resonance) VALUES(?,?,?,?,?)",
+            [(episode_id, ev["step"], ev.get("doc_name"), ev["chunk_start"], ev["resonance"]) for ev in events.get("chunks", [])]
+        )
     conn.commit()
     conn.close()
 def ingest_ids(mw, ids, amount=0.02):
@@ -858,6 +933,18 @@ def ch_xfire(c, it):
             c.soma[i] = clampf(0.94 * c.soma[i] + 0.02 * c.act[i], 0.0, 1.0)
         c.presence = clampf(0.95 * c.presence + 0.03 * c.emergence(), 0.0, 1.0)
         c.scar = clampf(c.scar * 0.985, 0.0, 1.0)
+def janus_phase_pressure(c, step_idx, total_steps):
+    if total_steps <= 0:
+        return
+    d = float(step_idx) / float(total_steps)
+    if d < 0.33:
+        c.act[CH_FLOW] = clampf(c.act[CH_FLOW] + 0.05, 0.0, 1.0)
+    elif d < 0.66:
+        c.act[CH_FEAR] = clampf(c.act[CH_FEAR] + 0.04, 0.0, 1.0)
+    else:
+        c.act[CH_VOID] = clampf(c.act[CH_VOID] + 0.05, 0.0, 1.0)
+    if d > 0.75:
+        c.act[CH_CMPLX] = clampf(c.act[CH_CMPLX] + 0.03, 0.0, 1.0)
 def velocity_profile(ch, dissonance):
     mode = VEL_WALK
     if dissonance > 0.8:
@@ -1764,6 +1851,7 @@ def spa_cross_attend(s, embs, S):
     return scores
 # ── chain ──
 def gen_chain(t, bpe, mw, ch, cids, clen, has_weights, parl, periodic=None, interference=None, input_text=None):
+    events = new_experience_log()
     # calendar dissonance
     try:
         epoch_t = time.mktime((2024, 10, 3, 12, 0, 0, 0, 0, -1))
@@ -1793,7 +1881,9 @@ def gen_chain(t, bpe, mw, ch, cids, clen, has_weights, parl, periodic=None, inte
         inp_bytes = input_text.encode("utf-8", errors="replace")
         ingest_ids(mw, bpe_encode(bpe, inp_bytes, len(inp_bytes), 512))
         ch.feel(input_text, periodic)
-        ch.absorb_dark_matter(input_text, periodic)
+        scar = ch.absorb_dark_matter(input_text, periodic)
+        if scar > 0.0:
+            events["scars"].append({"step": -1, "scar": scar, "note": "prompt"})
         ch.act[CH_FLOW] = clampf(ch.act[CH_FLOW] + 0.1, 0.0, 1.0)
         ch_xfire(ch, 8)
     vel = velocity_profile(ch, cd)
@@ -1818,6 +1908,10 @@ def gen_chain(t, bpe, mw, ch, cids, clen, has_weights, parl, periodic=None, inte
     chain_lens = [0] * CHAIN_STEPS
 
     for si in range(CHAIN_STEPS):
+        janus_phase_pressure(ch, si, CHAIN_STEPS)
+        d_phase = float(si) / float(CHAIN_STEPS)
+        phase = "flow" if d_phase < 0.33 else ("fear" if d_phase < 0.66 else "void")
+        events["phases"].append({"step": si, "phase": phase, "flow": ch.act[CH_FLOW], "fear": ch.act[CH_FEAR], "void": ch.act[CH_VOID], "complexity": ch.act[CH_CMPLX]})
         if si < nb:
             direction = -1
         elif si == nb:
@@ -1827,6 +1921,8 @@ def gen_chain(t, bpe, mw, ch, cids, clen, has_weights, parl, periodic=None, inte
 
         active_doc = interference.choose_doc(input_text, ch, periodic, mw, bpe) if interference is not None and interference.docs else None
         active_chunk = interference.choose_chunk(active_doc, input_text, ch, periodic, mw, bpe) if active_doc is not None else None
+        if active_chunk is not None:
+            events["chunks"].append({"step": si, "doc_name": active_doc.get("name") if active_doc is not None else None, "chunk_start": int(active_chunk.get("start", 0)), "resonance": float(len(active_chunk.get("heavy", [])))})
         if active_chunk is not None and t.D > 0 and active_chunk.get("heavy"):
             seed_tok = active_chunk["heavy"][0]
             if 0 <= seed_tok < t.V:
@@ -1928,6 +2024,7 @@ def gen_chain(t, bpe, mw, ch, cids, clen, has_weights, parl, periodic=None, inte
                         ch.debt = clampf(ch.debt + 0.04, 0.0, 1.0)
                     else:
                         ch.debt = clampf(ch.debt * 0.97, 0.0, 1.0)
+                    events["wormholes"].append({"step": si, "success": best_sc >= 0.15, "coherence": best_sc, "debt": ch.debt})
 
         mk = '<' if direction < 0 else ('*' if direction == 0 else '>')
         marker = mk + ('+' if wormhole else ' ')
@@ -1958,6 +2055,7 @@ def gen_chain(t, bpe, mw, ch, cids, clen, has_weights, parl, periodic=None, inte
 
         chain_ids[si] = list(best_out)
         chain_lens[si] = best_ol
+        events["prophecies"].append({"step": si, "pressure": prophecy_pressure(mw), "debt": ch.debt})
         ch_xfire(ch, 3)
         ch.debt = 0.9 * ch.debt + 0.05
 
@@ -2015,6 +2113,7 @@ def gen_chain(t, bpe, mw, ch, cids, clen, has_weights, parl, periodic=None, inte
     # Hebbian decay
     for i in range(mw.n_hebb):
         mw.hebbs[i][2] *= 0.998
+    return events
 # ── main ──
 def main():
     print("PostGPT-Q \u2014 Resonant Reasoning Engine (Python)")
@@ -2107,9 +2206,10 @@ def main():
     parl = Parliament()
     parl_init(parl, t.D, 4)
     print("  %d experts, rank=%d, d_model=%d, alpha=%.2f" % (parl.n, DOE_RANK, t.D, parl.alpha))
+    run_events = new_experience_log()
 
     print("\n========== 12 BIDIRECTIONAL STEPS ==========")
-    gen_chain(t, bpe, mw, ch, cids, clen_corpus, has_weights, parl, periodic, interference)
+    merge_experience_log(run_events, gen_chain(t, bpe, mw, ch, cids, clen_corpus, has_weights, parl, periodic, interference))
 
     print("\ntype -> 12 sentences. 'quit' to exit.\n")
 
@@ -2129,13 +2229,13 @@ def main():
             ingest_ids(mw, uids)
             if len(uids) > 1:
                 print("  [ingested %d tokens: +bi +tri +hebb]" % len(uids))
-            gen_chain(t, bpe, mw, ch, cids, clen_corpus, has_weights, parl, periodic, interference, inp)
+            merge_experience_log(run_events, gen_chain(t, bpe, mw, ch, cids, clen_corpus, has_weights, parl, periodic, interference, inp))
     except (KeyboardInterrupt, EOFError):
         pass
 
     # save memory
     try:
-        save_memory_sqlite(mw, "q.sqlite", periodic, ch)
+        save_memory_sqlite(mw, "q.sqlite", periodic, ch, run_events)
         save_memory(mw, "q.memory", periodic, ch)
         print("  [memory saved: %d bi, %d tri, %d hebb, %d periodic \u2192 q.sqlite + q.memory]" % (mw.n_bi, mw.n_tri, mw.n_hebb, len(periodic.elements)))
     except Exception:

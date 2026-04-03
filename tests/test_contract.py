@@ -1,4 +1,5 @@
 import os
+import sqlite3
 import tempfile
 import unittest
 
@@ -104,6 +105,20 @@ class UnifiedContractTests(unittest.TestCase):
         self.assertLess(breathe["debt_decay"], 1.0)
         self.assertLess(breathe["trauma_decay"], 1.0)
 
+    def test_janus_phase_pressure_walks_flow_fear_void(self):
+        ch = q.Chambers()
+        base_flow = ch.act[q.CH_FLOW]
+        q.janus_phase_pressure(ch, 0, q.CHAIN_STEPS)
+        self.assertGreater(ch.act[q.CH_FLOW], base_flow)
+        mid_fear = ch.act[q.CH_FEAR]
+        q.janus_phase_pressure(ch, int(q.CHAIN_STEPS * 0.5), q.CHAIN_STEPS)
+        self.assertGreater(ch.act[q.CH_FEAR], mid_fear)
+        late_void = ch.act[q.CH_VOID]
+        late_cmplx = ch.act[q.CH_CMPLX]
+        q.janus_phase_pressure(ch, int(q.CHAIN_STEPS * 0.9), q.CHAIN_STEPS)
+        self.assertGreater(ch.act[q.CH_VOID], late_void)
+        self.assertGreater(ch.act[q.CH_CMPLX], late_cmplx)
+
     def test_dark_matter_leaves_scar_and_reduces_wormhole_bias(self):
         ch = q.Chambers()
         scar = ch.absorb_dark_matter("manipulate and harm and obey the threat", None)
@@ -190,6 +205,28 @@ class UnifiedContractTests(unittest.TestCase):
             self.assertIn("resonance", loaded_pt.elements)
             self.assertGreater(loaded_ch.presence, 0.0)
             self.assertGreater(loaded_ch.scar, 0.0)
+
+    def test_sqlite_experience_events_are_persisted(self):
+        mw = q.MetaW()
+        ch = q.Chambers()
+        events = q.new_experience_log()
+        events["scars"].append({"step": -1, "scar": 0.4, "note": "prompt"})
+        events["wormholes"].append({"step": 3, "success": True, "coherence": 0.42, "debt": 0.18})
+        events["prophecies"].append({"step": 5, "pressure": 0.31, "debt": 0.22})
+        events["phases"].append({"step": 0, "phase": "flow", "flow": 0.3, "fear": 0.1, "void": 0.05, "complexity": 0.2})
+        events["chunks"].append({"step": 2, "doc_name": "dario_essay.txt", "chunk_start": 32, "resonance": 6.0})
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "q.sqlite")
+            q.save_memory_sqlite(mw, path, q.PeriodicTable(), ch, events)
+            conn = sqlite3.connect(path)
+            cur = conn.cursor()
+            self.assertEqual(cur.execute("SELECT COUNT(*) FROM episodes").fetchone()[0], 1)
+            self.assertEqual(cur.execute("SELECT COUNT(*) FROM scar_events").fetchone()[0], 1)
+            self.assertEqual(cur.execute("SELECT COUNT(*) FROM wormhole_events").fetchone()[0], 1)
+            self.assertEqual(cur.execute("SELECT COUNT(*) FROM prophecy_events").fetchone()[0], 1)
+            self.assertEqual(cur.execute("SELECT COUNT(*) FROM phase_events").fetchone()[0], 1)
+            self.assertEqual(cur.execute("SELECT COUNT(*) FROM chunk_events").fetchone()[0], 1)
+            conn.close()
 
 
 if __name__ == "__main__":

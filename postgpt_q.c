@@ -356,6 +356,19 @@ typedef struct{
     int mode; float temp_mul,heb_mul,pro_mul,ds_mul,bg_mul,tg_mul;
     float interf_bonus,wormhole_bonus,debt_decay,trauma_decay,scar_decay,dark_pressure;
 }VelocityProfile;
+typedef struct{int step; float scar; char note[24];}ScarEvent;
+typedef struct{int step; int success; float coherence,debt;}WormholeEvent;
+typedef struct{int step; float pressure,debt;}ProphecyEvent;
+typedef struct{int step; char phase[12]; float flow,fear,voidv,complexity;}PhaseEvent;
+typedef struct{int step; char doc_name[64]; int chunk_start; float resonance;}ChunkEvent;
+typedef struct{
+    ScarEvent scars[128]; int n_scars;
+    WormholeEvent wormholes[256]; int n_wormholes;
+    ProphecyEvent prophecies[512]; int n_prophecies;
+    PhaseEvent phases[256]; int n_phases;
+    ChunkEvent chunks[256]; int n_chunks;
+}ExperienceLog;
+static ExperienceLog QEXP={0};
 
 static void ch_init(Chambers *c){memset(c,0,sizeof(*c));c->act[CH_LOVE]=0.2f;c->act[CH_FLOW]=0.15f;c->trauma=0;}
 static void ch_xfire(Chambers *c, int it){
@@ -369,6 +382,41 @@ static void ch_xfire(Chambers *c, int it){
             +0.01f*(0.35f*c->soma[CH_LOVE]+0.30f*c->soma[CH_FLOW]+0.20f*c->soma[CH_CMPLX]+0.15f*c->soma[CH_VOID]),0,1);
         c->scar=clampf(c->scar*0.985f,0,1);
     }
+}
+static void janus_phase_pressure(Chambers *c, int step_idx, int total_steps){
+    if(total_steps<=0) return;
+    float d=(float)step_idx/(float)total_steps;
+    if(d<0.33f) c->act[CH_FLOW]=clampf(c->act[CH_FLOW]+0.05f,0,1);
+    else if(d<0.66f) c->act[CH_FEAR]=clampf(c->act[CH_FEAR]+0.04f,0,1);
+    else c->act[CH_VOID]=clampf(c->act[CH_VOID]+0.05f,0,1);
+    if(d>0.75f) c->act[CH_CMPLX]=clampf(c->act[CH_CMPLX]+0.03f,0,1);
+}
+static void qexp_add_scar(int step, float scar, const char *note){
+    if(QEXP.n_scars>=128) return;
+    QEXP.scars[QEXP.n_scars]=(ScarEvent){step,scar,{0}};
+    if(note) snprintf(QEXP.scars[QEXP.n_scars].note,sizeof(QEXP.scars[QEXP.n_scars].note),"%s",note);
+    QEXP.n_scars++;
+}
+static void qexp_add_wormhole(int step, int success, float coherence, float debt){
+    if(QEXP.n_wormholes>=256) return;
+    QEXP.wormholes[QEXP.n_wormholes++] = (WormholeEvent){step,success,coherence,debt};
+}
+static void qexp_add_prophecy(int step, float pressure, float debt){
+    if(QEXP.n_prophecies>=512) return;
+    QEXP.prophecies[QEXP.n_prophecies++] = (ProphecyEvent){step,pressure,debt};
+}
+static void qexp_add_phase(int step, const char *phase, const Chambers *c){
+    if(QEXP.n_phases>=256) return;
+    PhaseEvent *e=&QEXP.phases[QEXP.n_phases++];
+    memset(e,0,sizeof(*e)); e->step=step;
+    snprintf(e->phase,sizeof(e->phase),"%s",phase?phase:"");
+    e->flow=c->act[CH_FLOW]; e->fear=c->act[CH_FEAR]; e->voidv=c->act[CH_VOID]; e->complexity=c->act[CH_CMPLX];
+}
+static void qexp_add_chunk(int step, const char *doc_name, int chunk_start, float resonance){
+    if(QEXP.n_chunks>=256) return;
+    ChunkEvent *e=&QEXP.chunks[QEXP.n_chunks++];
+    memset(e,0,sizeof(*e)); e->step=step; e->chunk_start=chunk_start; e->resonance=resonance;
+    if(doc_name) snprintf(e->doc_name,sizeof(e->doc_name),"%s",doc_name);
 }
 static int periodic_find(const PeriodicTable *pt, const char *word){
     for(int i=0;i<pt->n;i++) if(strcmp(pt->elements[i].word,word)==0) return i;
@@ -1208,7 +1256,8 @@ static void gen_chain(TF *t, const BPE *bpe, MetaW *mw, Chambers *ch,
         int uids[512]; int ulen=bpe_encode(bpe,(const uint8_t*)input_text,(int)strlen(input_text),uids,512);
         ingest_ids(mw,uids,ulen,0.02f);
         ch_feel_text(ch,input_text,pt);
-        ch_absorb_dark_matter(ch,input_text,pt);
+        float scar=ch_absorb_dark_matter(ch,input_text,pt);
+        if(scar>0) qexp_add_scar(-1,scar,"prompt");
         ch->act[CH_FLOW]=clampf(ch->act[CH_FLOW]+0.1f,0,1);
         ch_xfire(ch,8);
     }
@@ -1229,9 +1278,13 @@ static void gen_chain(TF *t, const BPE *bpe, MetaW *mw, Chambers *ch,
     SPACtx spa; spa_init(&spa,t->V);
     int chain_ids[CHAIN_STEPS][256]; int chain_lens[CHAIN_STEPS];
     for(int si=0;si<CHAIN_STEPS;si++){
+        janus_phase_pressure(ch,si,CHAIN_STEPS);
+        float d_phase=(float)si/(float)CHAIN_STEPS;
+        qexp_add_phase(si,d_phase<0.33f?"flow":(d_phase<0.66f?"fear":"void"),ch);
         int dir=si<nb?-1:(si==nb?0:1);
         const InterferenceDoc *active_doc=(itf&&itf->n_docs>0)?interf_choose_doc(itf,input_text,ch,pt,mw,bpe):NULL;
         const InterferenceChunk *active_chunk=active_doc?interf_choose_chunk(active_doc,input_text,ch,pt,mw,bpe):NULL;
+        if(active_chunk) qexp_add_chunk(si,active_doc?active_doc->name:"",active_chunk->start,(float)active_chunk->n_heavy);
         float *doc_signal=NULL;
         if(active_chunk){
             doc_signal=calloc(t->V,sizeof(float));
@@ -1315,6 +1368,7 @@ static void gen_chain(TF *t, const BPE *bpe, MetaW *mw, Chambers *ch,
                     best_sc=coherence_score(mw,best_out,best_ol,t->V);
                     if(best_sc<0.15f) ch->debt=clampf(ch->debt+0.04f,0,1);
                     else ch->debt=clampf(ch->debt*0.97f,0,1);
+                    qexp_add_wormhole(si,best_sc>=0.15f,best_sc,ch->debt);
                 }
             }
         }
@@ -1335,6 +1389,7 @@ static void gen_chain(TF *t, const BPE *bpe, MetaW *mw, Chambers *ch,
         }
         /* save for SPA */
         chain_lens[si]=best_ol; memcpy(chain_ids[si],best_out,best_ol*sizeof(int));
+        qexp_add_prophecy(si,prophecy_pressure(mw),ch->debt);
         ch_xfire(ch,3); ch->debt=0.9f*ch->debt+0.05f; if(doc_signal) free(doc_signal);
     }
     /* SPA: iterative cross-attention — reseed weak sentences, verify improvement */
@@ -1458,6 +1513,11 @@ static int qsqlite_save(const MetaW *mw, const char *path, const PeriodicTable *
         "CREATE TABLE IF NOT EXISTS periodic_elements(word TEXT PRIMARY KEY,chamber INTEGER,mass REAL);\n"
         "CREATE TABLE IF NOT EXISTS chambers(id INTEGER PRIMARY KEY CHECK(id=1),presence REAL,debt REAL,trauma REAL,soma0 REAL,soma1 REAL,soma2 REAL,soma3 REAL,soma4 REAL,soma5 REAL);\n"
         "CREATE TABLE IF NOT EXISTS episodes(id INTEGER PRIMARY KEY AUTOINCREMENT,kind TEXT,payload TEXT,created_at TEXT DEFAULT CURRENT_TIMESTAMP);\n"
+        "CREATE TABLE IF NOT EXISTS scar_events(id INTEGER PRIMARY KEY AUTOINCREMENT,episode_id INTEGER NOT NULL,step INTEGER NOT NULL,scar REAL NOT NULL,note TEXT,created_at TEXT DEFAULT CURRENT_TIMESTAMP);\n"
+        "CREATE TABLE IF NOT EXISTS wormhole_events(id INTEGER PRIMARY KEY AUTOINCREMENT,episode_id INTEGER NOT NULL,step INTEGER NOT NULL,success INTEGER NOT NULL,coherence REAL NOT NULL,debt REAL NOT NULL,created_at TEXT DEFAULT CURRENT_TIMESTAMP);\n"
+        "CREATE TABLE IF NOT EXISTS prophecy_events(id INTEGER PRIMARY KEY AUTOINCREMENT,episode_id INTEGER NOT NULL,step INTEGER NOT NULL,pressure REAL NOT NULL,debt REAL NOT NULL,created_at TEXT DEFAULT CURRENT_TIMESTAMP);\n"
+        "CREATE TABLE IF NOT EXISTS phase_events(id INTEGER PRIMARY KEY AUTOINCREMENT,episode_id INTEGER NOT NULL,step INTEGER NOT NULL,phase TEXT NOT NULL,flow REAL NOT NULL,fear REAL NOT NULL,void REAL NOT NULL,complexity REAL NOT NULL,created_at TEXT DEFAULT CURRENT_TIMESTAMP);\n"
+        "CREATE TABLE IF NOT EXISTS chunk_events(id INTEGER PRIMARY KEY AUTOINCREMENT,episode_id INTEGER NOT NULL,step INTEGER NOT NULL,doc_name TEXT,chunk_start INTEGER NOT NULL,resonance REAL NOT NULL,created_at TEXT DEFAULT CURRENT_TIMESTAMP);\n"
         "INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version','1');\n"
         "DELETE FROM bigrams;DELETE FROM trigrams;DELETE FROM hebb;DELETE FROM prophecies;DELETE FROM periodic_elements;DELETE FROM chambers;\n");
     for(int i=0;i<mw->n_bi;i++) fprintf(sf,"INSERT INTO bigrams(a,b,prob) VALUES(%d,%d,%.9g);\n",mw->bigrams[i].a,mw->bigrams[i].b,mw->bigrams[i].prob);
@@ -1468,7 +1528,13 @@ static int qsqlite_save(const MetaW *mw, const char *path, const PeriodicTable *
     fprintf(sf,"INSERT OR REPLACE INTO meta(key,value) VALUES('scar','%.9g');\n",ch->scar);
     fprintf(sf,"INSERT INTO chambers(id,presence,debt,trauma,soma0,soma1,soma2,soma3,soma4,soma5) VALUES(1,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g);\n",
         ch->presence,ch->debt,ch->trauma,ch->soma[0],ch->soma[1],ch->soma[2],ch->soma[3],ch->soma[4],ch->soma[5]);
-    fprintf(sf,"INSERT INTO episodes(kind,payload) VALUES('snapshot','bi=%d;tri=%d;hebb=%d;prophecy=%d');\nCOMMIT;\n",mw->n_bi,mw->n_tri,mw->n_hebb,mw->n_prophecy);
+    fprintf(sf,"INSERT INTO episodes(kind,payload) VALUES('snapshot','bi=%d;tri=%d;hebb=%d;prophecy=%d');\n",mw->n_bi,mw->n_tri,mw->n_hebb,mw->n_prophecy);
+    for(int i=0;i<QEXP.n_scars;i++){ char note[64]; qsqlite_escape(QEXP.scars[i].note,note,sizeof(note)); fprintf(sf,"INSERT INTO scar_events(episode_id,step,scar,note) VALUES((SELECT MAX(id) FROM episodes),%d,%.9g,'%s');\n",QEXP.scars[i].step,QEXP.scars[i].scar,note); }
+    for(int i=0;i<QEXP.n_wormholes;i++) fprintf(sf,"INSERT INTO wormhole_events(episode_id,step,success,coherence,debt) VALUES((SELECT MAX(id) FROM episodes),%d,%d,%.9g,%.9g);\n",QEXP.wormholes[i].step,QEXP.wormholes[i].success,QEXP.wormholes[i].coherence,QEXP.wormholes[i].debt);
+    for(int i=0;i<QEXP.n_prophecies;i++) fprintf(sf,"INSERT INTO prophecy_events(episode_id,step,pressure,debt) VALUES((SELECT MAX(id) FROM episodes),%d,%.9g,%.9g);\n",QEXP.prophecies[i].step,QEXP.prophecies[i].pressure,QEXP.prophecies[i].debt);
+    for(int i=0;i<QEXP.n_phases;i++){ char phase[32]; qsqlite_escape(QEXP.phases[i].phase,phase,sizeof(phase)); fprintf(sf,"INSERT INTO phase_events(episode_id,step,phase,flow,fear,void,complexity) VALUES((SELECT MAX(id) FROM episodes),%d,'%s',%.9g,%.9g,%.9g,%.9g);\n",QEXP.phases[i].step,phase,QEXP.phases[i].flow,QEXP.phases[i].fear,QEXP.phases[i].voidv,QEXP.phases[i].complexity); }
+    for(int i=0;i<QEXP.n_chunks;i++){ char doc[96]; qsqlite_escape(QEXP.chunks[i].doc_name,doc,sizeof(doc)); fprintf(sf,"INSERT INTO chunk_events(episode_id,step,doc_name,chunk_start,resonance) VALUES((SELECT MAX(id) FROM episodes),%d,'%s',%d,%.9g);\n",QEXP.chunks[i].step,doc,QEXP.chunks[i].chunk_start,QEXP.chunks[i].resonance); }
+    fprintf(sf,"COMMIT;\n");
     fclose(sf);
     char cmd[768];
     snprintf(cmd,sizeof(cmd),"sqlite3 '%s' < '%s' >/dev/null 2>&1",path,tpl);

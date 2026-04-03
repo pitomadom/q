@@ -763,6 +763,14 @@ function velocityProfile(currentChambers,dissonance){
   prof.darkPressure=0.18*currentChambers.scar;
   return prof;
 }
+function janusPhasePressure(currentChambers,stepIdx,totalSteps){
+  if(totalSteps<=0)return;
+  const d=stepIdx/totalSteps;
+  if(d<0.33)currentChambers.act[4]=Math.max(0,Math.min(1,currentChambers.act[4]+0.05));
+  else if(d<0.66)currentChambers.act[0]=Math.max(0,Math.min(1,currentChambers.act[0]+0.04));
+  else currentChambers.act[3]=Math.max(0,Math.min(1,currentChambers.act[3]+0.05));
+  if(d>0.75)currentChambers.act[5]=Math.max(0,Math.min(1,currentChambers.act[5]+0.03));
+}
 
 class Interference {
   constructor(){this.docs=[];}
@@ -1344,6 +1352,7 @@ function generateChain(inputText){
   function isSentStart(r){return r+5<=corpusIds.length&&bpe.isBoundary(corpusIds[r])&&bpe.startsWithSpace(corpusIds[r+1]);}
 
   for(let si=0;si<CHAIN;si++){
+    janusPhasePressure(chambers,si,CHAIN);
     let dir=si<nb?-1:si===nb?0:1;
     const activeDoc=interference&&interference.docs.length?interference.chooseDoc(inputText,chambers,periodic,mw,bpe):null;
     const activeChunk=activeDoc?interference.chooseChunk(activeDoc,inputText,chambers,periodic,mw,bpe):null;
