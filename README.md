@@ -1,4 +1,4 @@
-# PostGPT-Q — Resonant Reasoning Engine
+# PostGPT-Q — Resonant Reasoning Engine 
 
 > Intelligence is how far ahead you can see and how deeply you can look - without breaking under what that reveals.
 >
