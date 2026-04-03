@@ -613,6 +613,33 @@ def load_memory_sqlite(mw, path, periodic=None, chambers=None):
                 scar_row = cur.execute("SELECT value FROM meta WHERE key='scar'").fetchone()
                 if scar_row is not None:
                     chambers.scar = clampf(max(getattr(chambers, "scar", 0.0), float(scar_row[0])), 0.0, 1.0)
+            scar_rows = list(cur.execute("SELECT scar FROM scar_events ORDER BY id DESC LIMIT 8"))
+            if scar_rows:
+                scar_res = sum(row[0] for row in scar_rows) / len(scar_rows)
+                chambers.scar = clampf(max(chambers.scar, 0.7 * scar_res), 0.0, 1.0)
+                chambers.trauma = clampf(max(chambers.trauma, 0.45 * scar_res), 0.0, 1.0)
+            worm_rows = list(cur.execute("SELECT success,debt FROM wormhole_events ORDER BY id DESC LIMIT 8"))
+            if worm_rows:
+                fail_ratio = sum(0 if row[0] else 1 for row in worm_rows) / len(worm_rows)
+                avg_debt = sum(row[1] for row in worm_rows) / len(worm_rows)
+                chambers.debt = clampf(max(chambers.debt, 0.55 * avg_debt + 0.10 * fail_ratio), 0.0, 1.0)
+            prophecy_rows = list(cur.execute("SELECT pressure,debt FROM prophecy_events ORDER BY id DESC LIMIT 12"))
+            if prophecy_rows:
+                avg_pressure = sum(row[0] for row in prophecy_rows) / len(prophecy_rows)
+                avg_debt = sum(row[1] for row in prophecy_rows) / len(prophecy_rows)
+                chambers.debt = clampf(max(chambers.debt, 0.45 * avg_pressure + 0.35 * avg_debt), 0.0, 1.0)
+            phase_rows = list(cur.execute("SELECT flow,fear,void,complexity FROM phase_events ORDER BY id DESC LIMIT 12"))
+            if phase_rows:
+                inv = 1.0 / len(phase_rows)
+                chambers.act[CH_FLOW] = clampf(max(chambers.act[CH_FLOW], sum(row[0] for row in phase_rows) * inv), 0.0, 1.0)
+                chambers.act[CH_FEAR] = clampf(max(chambers.act[CH_FEAR], sum(row[1] for row in phase_rows) * inv), 0.0, 1.0)
+                chambers.act[CH_VOID] = clampf(max(chambers.act[CH_VOID], sum(row[2] for row in phase_rows) * inv), 0.0, 1.0)
+                chambers.act[CH_CMPLX] = clampf(max(chambers.act[CH_CMPLX], sum(row[3] for row in phase_rows) * inv), 0.0, 1.0)
+            chunk_rows = list(cur.execute("SELECT resonance FROM chunk_events ORDER BY id DESC LIMIT 12"))
+            if chunk_rows:
+                avg_res = sum(row[0] for row in chunk_rows) / len(chunk_rows)
+                chambers.act[CH_CMPLX] = clampf(max(chambers.act[CH_CMPLX], 0.04 * avg_res), 0.0, 1.0)
+                chambers.act[CH_FLOW] = clampf(max(chambers.act[CH_FLOW], 0.03 * avg_res), 0.0, 1.0)
         conn.close()
         return True
     except Exception:

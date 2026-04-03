@@ -1502,6 +1502,31 @@ static int qsqlite_load(MetaW *mw, const char *path, PeriodicTable *pt, Chambers
     fp=popen(cmd,"r"); if(!fp) return 0;
     if(fgets(line,sizeof(line),fp)) ch->scar=clampf(atof(line),0,1);
     pclose(fp);
+    snprintf(cmd,sizeof(cmd),"sqlite3 -tabs -noheader '%s' \"SELECT scar FROM scar_events ORDER BY id DESC LIMIT 8;\"",path);
+    fp=popen(cmd,"r"); if(!fp) return 0;
+    {float sum=0; int n=0; while(fgets(line,sizeof(line),fp)){ sum+=atof(line); n++; }
+    if(n>0){ float scar_res=sum/n; ch->scar=clampf(ch->scar>0.7f*scar_res?ch->scar:0.7f*scar_res,0,1); ch->trauma=clampf(ch->trauma>0.45f*scar_res?ch->trauma:0.45f*scar_res,0,1); }}
+    pclose(fp);
+    snprintf(cmd,sizeof(cmd),"sqlite3 -tabs -noheader '%s' \"SELECT success,debt FROM wormhole_events ORDER BY id DESC LIMIT 8;\"",path);
+    fp=popen(cmd,"r"); if(!fp) return 0;
+    {float fail_sum=0,debt_sum=0; int n=0; while(fgets(line,sizeof(line),fp)){ int success=0; float debt=0; if(sscanf(line,"%d\t%f",&success,&debt)==2){ fail_sum+=success?0.0f:1.0f; debt_sum+=debt; n++; } }
+    if(n>0){ float fail_ratio=fail_sum/n, avg_debt=debt_sum/n; float target=0.55f*avg_debt+0.10f*fail_ratio; ch->debt=clampf(ch->debt>target?ch->debt:target,0,1); }}
+    pclose(fp);
+    snprintf(cmd,sizeof(cmd),"sqlite3 -tabs -noheader '%s' \"SELECT pressure,debt FROM prophecy_events ORDER BY id DESC LIMIT 12;\"",path);
+    fp=popen(cmd,"r"); if(!fp) return 0;
+    {float p_sum=0,debt_sum=0; int n=0; while(fgets(line,sizeof(line),fp)){ float pressure=0,debt=0; if(sscanf(line,"%f\t%f",&pressure,&debt)==2){ p_sum+=pressure; debt_sum+=debt; n++; } }
+    if(n>0){ float target=0.45f*(p_sum/n)+0.35f*(debt_sum/n); ch->debt=clampf(ch->debt>target?ch->debt:target,0,1); }}
+    pclose(fp);
+    snprintf(cmd,sizeof(cmd),"sqlite3 -tabs -noheader '%s' \"SELECT flow,fear,void,complexity FROM phase_events ORDER BY id DESC LIMIT 12;\"",path);
+    fp=popen(cmd,"r"); if(!fp) return 0;
+    {float flow=0,fear=0,voidv=0,complexity=0; int n=0; while(fgets(line,sizeof(line),fp)){ float a=0,b=0,c=0,d=0; if(sscanf(line,"%f\t%f\t%f\t%f",&a,&b,&c,&d)==4){ flow+=a; fear+=b; voidv+=c; complexity+=d; n++; } }
+    if(n>0){ flow/=n; fear/=n; voidv/=n; complexity/=n; ch->act[CH_FLOW]=clampf(ch->act[CH_FLOW]>flow?ch->act[CH_FLOW]:flow,0,1); ch->act[CH_FEAR]=clampf(ch->act[CH_FEAR]>fear?ch->act[CH_FEAR]:fear,0,1); ch->act[CH_VOID]=clampf(ch->act[CH_VOID]>voidv?ch->act[CH_VOID]:voidv,0,1); ch->act[CH_CMPLX]=clampf(ch->act[CH_CMPLX]>complexity?ch->act[CH_CMPLX]:complexity,0,1); }}
+    pclose(fp);
+    snprintf(cmd,sizeof(cmd),"sqlite3 -tabs -noheader '%s' \"SELECT resonance FROM chunk_events ORDER BY id DESC LIMIT 12;\"",path);
+    fp=popen(cmd,"r"); if(!fp) return 0;
+    {float sum=0; int n=0; while(fgets(line,sizeof(line),fp)){ sum+=atof(line); n++; }
+    if(n>0){ float avg=sum/n; float complex_t=0.04f*avg, flow_t=0.03f*avg; ch->act[CH_CMPLX]=clampf(ch->act[CH_CMPLX]>complex_t?ch->act[CH_CMPLX]:complex_t,0,1); ch->act[CH_FLOW]=clampf(ch->act[CH_FLOW]>flow_t?ch->act[CH_FLOW]:flow_t,0,1); }}
+    pclose(fp);
     return 1;
 }
 

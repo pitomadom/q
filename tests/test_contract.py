@@ -255,6 +255,15 @@ class UnifiedContractTests(unittest.TestCase):
             self.assertEqual(cur.execute("SELECT COUNT(*) FROM chunk_events").fetchone()[0], 1)
             conn.close()
 
+            loaded_mw = q.MetaW()
+            loaded_pt = q.PeriodicTable()
+            loaded_ch = q.Chambers()
+            self.assertTrue(q.load_memory_sqlite(loaded_mw, path, loaded_pt, loaded_ch))
+            self.assertGreater(loaded_ch.scar, 0.0)
+            self.assertGreater(loaded_ch.debt, 0.0)
+            self.assertGreater(loaded_ch.act[q.CH_FLOW], 0.0)
+            self.assertGreater(loaded_ch.act[q.CH_CMPLX], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

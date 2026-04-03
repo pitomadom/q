@@ -152,7 +152,7 @@ A direction vector persists across all 12 steps. Each sentence inherits 30% of g
 
 ### Memory Persistence
 
-`q.sqlite` is the primary circulating memory organ for the native engines. It stores evolving MetaWeights, the active prophecy field, periodic elements, chamber residue, and session snapshots in structured form. It now also records **experience events**: scar pressure, wormhole attempts, prophecy pressure, phase shifts, and chunk resonance hits. `q.memory` remains as a compact binary shard: fallback, backup, and portable snapshot of the same field. Q remembers through state and event residue, not raw transcript replay. Periodic elements (semantic anchors classified by chamber affinity) persist, so Q's vocabulary enriches over time. Somatic state persists as chamber-aligned bodily memory rather than raw text.
+`q.sqlite` is the primary circulating memory organ for the native engines. It stores evolving MetaWeights, the active prophecy field, periodic elements, chamber residue, and session snapshots in structured form. It also records **experience events**: scar pressure, wormhole attempts, prophecy pressure, phase shifts, and chunk resonance hits. Those events are not passive logs anymore: recent residue is folded back into chamber state on load, so the next run begins with a softened but real trace of what happened before. `q.memory` remains as a compact binary shard: fallback, backup, and portable snapshot of the same field. Q remembers through state and event residue, not raw transcript replay. Periodic elements (semantic anchors classified by chamber affinity) persist, so Q's vocabulary enriches over time. Somatic state persists as chamber-aligned bodily memory rather than raw text.
 
 ### SPA — Sentence Phonon Attention
 
