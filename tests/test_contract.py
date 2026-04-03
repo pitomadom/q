@@ -69,6 +69,28 @@ class UnifiedContractTests(unittest.TestCase):
             self.assertGreater(loaded_ch.presence, 0.0)
             self.assertGreater(loaded_ch.soma[q.CH_LOVE], 0.0)
 
+    def test_legacy_memory_still_loads_without_somatic_tail(self):
+        mw = q.MetaW()
+        q.ingest_ids(mw, [1, 2, 3, 4], 0.02)
+        pt = q.PeriodicTable()
+        pt.build_from_text("resonance rhythm paradox")
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "q.memory")
+            q.save_memory(mw, path, pt)
+            with open(path, "rb") as f:
+                raw = f.read()
+            legacy = raw[:-40]
+            with open(path, "wb") as f:
+                f.write(legacy)
+            loaded_mw = q.MetaW()
+            loaded_pt = q.PeriodicTable()
+            loaded_ch = q.Chambers()
+            self.assertTrue(q.load_memory(loaded_mw, path, loaded_pt, loaded_ch))
+            self.assertGreater(loaded_mw.n_bi, 0)
+            self.assertIn("resonance", loaded_pt.elements)
+            self.assertEqual(loaded_ch.presence, 0.0)
+            self.assertTrue(all(v == 0.0 for v in loaded_ch.soma))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -71,6 +71,16 @@ Democracy of Experts. 4 LoRA experts (rank=4) that vote, learn, split, and die d
 
 Cross-fire: `act[i] += 0.03 * coupling[i][j] * sin(act[j] - act[i])`. In interactive mode, user input modulates chambers by keyword sentiment.
 
+### Somatic Resonance
+
+Q also listens for bodily language before it speaks. A compact English somatic lexicon maps words like `chest`, `throat`, `warmth`, `pressure`, `tremor`, `burning`, `floating` into a 6-dimensional chamber-space. This produces a persistent internal somatic vector:
+
+- **Soma** — chamber-aligned bodily residue carried across turns
+- **Presence** — intensity estimate distilled from somatic hits
+- **Trauma / debt drift** — updated numerically from the somatic field, then fed back into chamber modulation
+
+This is not a second engine. Somatic resonance only biases chamber coefficients and therefore the same RRPRAM/transformer-facing logit path.
+
 ### Calendar Dissonance
 
 Hebrew-Gregorian calendar drift computed from real astronomical data (epoch: 1 Tishrei 5785 = Oct 3, 2024). Metonic cycle corrections. Drift modulates the backward/forward balance in the 12-step chain.
@@ -116,7 +126,7 @@ A direction vector persists across all 12 steps. Each sentence inherits 30% of g
 
 ### Memory Persistence
 
-`q.memory` — binary file saves/loads MetaWeights between sessions. Q remembers conversations. Bigrams, trigrams, Hebbian associations, **and the Periodic Table** evolve across runs. Periodic elements (semantic anchors classified by chamber affinity) persist, so Q's vocabulary enriches over time.
+`q.memory` — binary file saves/loads MetaWeights between sessions. Q remembers conversations. Bigrams, trigrams, Hebbian associations, **the Periodic Table, and the somatic chamber residue** evolve across runs. Periodic elements (semantic anchors classified by chamber affinity) persist, so Q's vocabulary enriches over time. Somatic state persists as chamber-aligned bodily memory rather than raw text.
 
 ### SPA — Sentence Phonon Attention
 
@@ -151,6 +161,7 @@ python3 postgpt_q.py q.merges q.txt
 
 # HTML/JS (browser — standalone, no server needed)
 # Open q.html in browser. Click DEMO or drag-drop q.txt. Drag-drop .bin weights for trained mode.
+# Browser memory persists through localStorage, including periodic semantics and somatic state.
 ```
 
 Requires: `q.merges` (BPE merge table, binary) and `q.txt` (corpus).
@@ -158,8 +169,8 @@ Requires: `q.merges` (BPE merge table, binary) and `q.txt` (corpus).
 ### Tests
 
 ```bash
-gcc tests/test_all.c -O2 -lm -o test_all && ./test_all    # 33 C tests
-python3 -m unittest tests.test_contract                     # 3 Python contract tests
+gcc tests/test_all.c -O2 -lm -o test_all && ./test_all    # 35 C tests
+python3 -m unittest tests.test_contract                     # 5 Python contract tests
 ```
 
 ## Example Output
@@ -233,7 +244,7 @@ The transformer gate silences untrained weights. Pure statistical generation fro
 
 ### JS/HTML inference (q.html, browser)
 
-Open `q.html` in browser. Click DEMO or drag-drop `q.txt`. Drag-drop `.bin` weights for trained mode.
+Open `q.html` in browser. Click DEMO or drag-drop `q.txt`. Drag-drop `.bin` weights for trained mode. Browser memory persists locally, so the semantic field and somatic residue survive reloads.
 
 ```
   [ 1] < The bow pressing steadily on the string, the sound occupying
@@ -257,7 +268,7 @@ After the initial 12 steps, Q enters interactive mode. Type anything:
   chambers: VOID:10% FLOW:9%
 ```
 
-User input is BPE-encoded and injected into MetaWeights. Keywords modulate somatic chambers. On exit, evolved MetaWeights are saved to `q.memory`.
+User input is BPE-encoded and injected into MetaWeights. Keywords modulate somatic chambers, update presence, and leave persistent chamber residue. On exit, evolved MetaWeights are saved to `q.memory`.
 
 ## What This Proves
 
