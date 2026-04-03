@@ -804,7 +804,7 @@ typedef struct{
 typedef struct{
     Expert ex[MAX_EXPERTS]; int n;
     int d_model; float alpha;
-    int step,last_k; float last_entropy;
+    int step,last_k,last_winners[MAX_EXPERTS],n_winners; float last_entropy,last_diversity;
 }Parliament;
 
 static void expert_init(Expert *e, int d_in, int d_out, int rank){
@@ -834,7 +834,7 @@ static void expert_hebbian(Expert *e, const float *x, const float *dy, float lr)
 }
 
 static void parl_init(Parliament *p, int d_model, int n_init){
-    p->d_model=d_model;p->alpha=DOE_ALPHA;p->step=0;p->last_k=0;p->last_entropy=0;
+    p->d_model=d_model;p->alpha=DOE_ALPHA;p->step=0;p->last_k=0;p->last_entropy=0;p->last_diversity=0;p->n_winners=0;
     p->n=n_init<MAX_EXPERTS?n_init:MAX_EXPERTS;
     for(int i=0;i<p->n;i++) expert_init(&p->ex[i],d_model,d_model,DOE_RANK);
 }
@@ -860,18 +860,53 @@ static void parl_election(Parliament *p, const float *x, float *result){
     entropy/=logf((float)(p->n>1?p->n:2));
     int k=1+(int)((p->n-1)*clampf(entropy,0,1)); if(k<1)k=1; if(k>p->n)k=p->n;
     p->last_k=k; p->last_entropy=entropy;
-    /* softmax over top-k */
-    float exps[MAX_EXPERTS],tot=0;
-    for(int i=0;i<k;i++){exps[i]=expf(votes[sel[i]]-sv);tot+=exps[i];}
-    for(int i=0;i<k;i++){
-        float w=exps[i]/tot;
-        for(int d=0;d<p->d_model;d++) result[d]+=w*outs[sel[i]][d];
-        p->ex[sel[i]].vitality=0.88f*p->ex[sel[i]].vitality+0.12f*fabsf(w);
-        p->ex[sel[i]].resonance=0.9f*p->ex[sel[i]].resonance+0.1f*votes[sel[i]];
-        p->ex[sel[i]].overload=clampf(0.92f*p->ex[sel[i]].overload+0.18f*((w-0.34f)>0?(w-0.34f):0),0,1);
-        p->ex[sel[i]].low_steps=0;
+    /* novelty-aware winner selection over top-k budget */
+    int winners[MAX_EXPERTS], n_winners=0;
+    unsigned char picked[MAX_EXPERTS]={0};
+    float diversity_sum=0;
+    for(int slot=0;slot<k;slot++){
+        int best_idx=-1; float best_score=-1e30f, best_novelty=0;
+        for(int si=0;si<p->n;si++){
+            int idx=sel[si]; if(picked[idx]) continue;
+            float novelty=1.0f;
+            if(n_winners>0){
+                float sim_sum=0;
+                float base_norm=1e-8f; for(int d=0;d<p->d_model;d++) base_norm+=outs[idx][d]*outs[idx][d];
+                base_norm=sqrtf(base_norm);
+                for(int wi=0;wi<n_winners;wi++){
+                    int prev=winners[wi];
+                    float other_norm=1e-8f,dot=0; for(int d=0;d<p->d_model;d++){ dot+=outs[idx][d]*outs[prev][d]; other_norm+=outs[prev][d]*outs[prev][d]; }
+                    other_norm=sqrtf(other_norm);
+                    {float sim=dot/(base_norm*other_norm); if(sim<0) sim=0; sim_sum+=sim;}
+                }
+                novelty=clampf(1.0f-sim_sum/n_winners,0,1);
+            }
+            {float score=votes[idx]+0.08f*novelty-0.06f*p->ex[idx].overload-0.03f*clampf(p->ex[idx].resonance,0,1);
+            if(score>best_score){best_score=score;best_idx=idx;best_novelty=novelty;}}
+        }
+        if(best_idx<0) break;
+        winners[n_winners++]=best_idx; picked[best_idx]=1; diversity_sum+=best_novelty;
     }
-    for(int i=k;i<p->n;i++){p->ex[sel[i]].vitality=clampf(0.97f*p->ex[sel[i]].vitality+0.01f*p->ex[sel[i]].resonance,0,1);p->ex[sel[i]].overload*=0.94f;p->ex[sel[i]].low_steps++;}
+    p->n_winners=n_winners; p->last_diversity=n_winners>0?diversity_sum/n_winners:0;
+    for(int i=0;i<n_winners;i++) p->last_winners[i]=winners[i];
+    /* softmax over winners */
+    float exps[MAX_EXPERTS],tot=0;
+    for(int i=0;i<n_winners;i++){exps[i]=expf(votes[winners[i]]-sv);tot+=exps[i];}
+    for(int i=0;i<n_winners;i++){
+        int idx=winners[i];
+        float w=exps[i]/tot;
+        for(int d=0;d<p->d_model;d++) result[d]+=w*outs[idx][d];
+        p->ex[idx].vitality=0.86f*p->ex[idx].vitality+0.14f*fabsf(w);
+        p->ex[idx].resonance=0.88f*p->ex[idx].resonance+0.12f*votes[idx];
+        p->ex[idx].overload=clampf(0.90f*p->ex[idx].overload+0.20f*((w-0.30f)>0?(w-0.30f):0),0,1);
+        p->ex[idx].low_steps=0;
+    }
+    for(int idx=0;idx<p->n;idx++) if(!picked[idx]){
+        float recovery=0.015f+0.03f*(1.0f-p->ex[idx].overload);
+        p->ex[idx].vitality=clampf(0.96f*p->ex[idx].vitality+recovery*clampf(fabsf(p->ex[idx].resonance),0,1),0,1);
+        p->ex[idx].overload*=0.92f;
+        p->ex[idx].low_steps++;
+    }
     for(int i=0;i<p->n;i++) free(outs[i]);
 }
 
@@ -895,7 +930,7 @@ static void parl_lifecycle(Parliament *p){
     /* apoptosis */
     int alive=0;
     for(int i=0;i<p->n;i++){
-        if(p->ex[i].low_steps>=10&&p->ex[i].vitality<0.08f&&p->ex[i].age>24&&p->n>2){
+        if(p->ex[i].low_steps>=12&&p->ex[i].vitality<0.06f&&fabsf(p->ex[i].resonance)<0.05f&&p->n>2&&p->ex[i].age>28){
             free(p->ex[i].A);free(p->ex[i].B);continue;}
         if(alive!=i) p->ex[alive]=p->ex[i];alive++;
     }
@@ -903,13 +938,13 @@ static void parl_lifecycle(Parliament *p){
     /* mitosis */
     int births=0;
     for(int i=0;i<p->n&&p->n+births<MAX_EXPERTS;i++){
-        if(p->ex[i].vitality>0.72f&&p->ex[i].age>40&&p->ex[i].overload>0.35f){
+        if(p->ex[i].vitality>0.70f&&p->ex[i].age>40&&p->ex[i].overload>0.32f){
             Expert *c=&p->ex[p->n+births];
             expert_init(c,p->ex[i].d_in,p->ex[i].d_out,p->ex[i].rank);
             for(int j=0;j<c->rank*c->d_in;j++) c->A[j]=p->ex[i].A[j]+0.005f*((float)rand()/RAND_MAX-0.5f);
             for(int j=0;j<c->d_out*c->rank;j++) c->B[j]=p->ex[i].B[j]+0.005f*((float)rand()/RAND_MAX-0.5f);
             c->vitality=0.5f;c->overload=0.18f;c->resonance=0.5f*p->ex[i].resonance;births++;
-            p->ex[i].vitality*=0.6f;
+            p->ex[i].vitality*=0.62f;
             p->ex[i].overload*=0.5f;
         }
     }

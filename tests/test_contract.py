@@ -135,6 +135,26 @@ class UnifiedContractTests(unittest.TestCase):
         self.assertLessEqual(p.last_k, p.n)
         self.assertGreaterEqual(p.last_entropy, 0.0)
         self.assertLessEqual(p.last_entropy, 1.0)
+        self.assertGreaterEqual(p.last_diversity, 0.0)
+        self.assertLessEqual(p.last_diversity, 1.0)
+        self.assertEqual(len(p.last_winners), p.last_k)
+
+    def test_parliament_diversity_pressure_penalizes_overload(self):
+        p = q.Parliament()
+        q.parl_init(p, 4, 4)
+        for e in p.ex:
+            for j in range(len(e.A)):
+                e.A[j] = 0.0
+            for j in range(len(e.B)):
+                e.B[j] = 0.0
+        p.ex[0].B[0] = 1.02
+        p.ex[1].B[0] = 1.00
+        p.ex[2].B[0] = 0.98
+        p.ex[3].B[0] = 0.20
+        p.ex[0].overload = 1.0
+        x = [1.0, 0.0, 0.0, 0.0]
+        q.parl_election(p, x)
+        self.assertNotEqual(p.last_winners[0], 0)
 
     def test_parliament_mitosis_uses_overload(self):
         p = q.Parliament()

@@ -1369,12 +1369,16 @@ class Parliament:
         self.step = 0
         self.last_k = 0
         self.last_entropy = 0.0
+        self.last_diversity = 0.0
+        self.last_winners = []
 def parl_init(p, d_model, n_init):
     p.d_model = d_model
     p.alpha = DOE_ALPHA
     p.step = 0
     p.last_k = 0
     p.last_entropy = 0.0
+    p.last_diversity = 0.0
+    p.last_winners = []
     p.n = min(n_init, MAX_EXPERTS)
     p.ex = []
     for _ in range(p.n):
@@ -1410,23 +1414,59 @@ def parl_election(p, x):
     k = max(1, min(p.n, k))
     p.last_k = k
     p.last_entropy = entropy
+    winners = []
+    picked = set()
+    diversity_sum = 0.0
+    for slot in range(k):
+        best_idx = -1
+        best_score = -1e30
+        best_novelty = 0.0
+        for idx in sel:
+            if idx in picked:
+                continue
+            novelty = 1.0
+            if winners:
+                sims = []
+                base = outs[idx]
+                base_norm = math.sqrt(sum(v * v for v in base)) + 1e-8
+                for prev in winners:
+                    other = outs[prev]
+                    other_norm = math.sqrt(sum(v * v for v in other)) + 1e-8
+                    dot = sum(base[d] * other[d] for d in range(p.d_model))
+                    sims.append(max(0.0, dot / (base_norm * other_norm)))
+                novelty = clampf(1.0 - sum(sims) / len(sims), 0.0, 1.0)
+            score = votes[idx] + 0.08 * novelty - 0.06 * p.ex[idx].overload - 0.03 * clampf(p.ex[idx].resonance, 0.0, 1.0)
+            if score > best_score:
+                best_score = score
+                best_idx = idx
+                best_novelty = novelty
+        if best_idx < 0:
+            break
+        winners.append(best_idx)
+        picked.add(best_idx)
+        diversity_sum += best_novelty
+    p.last_winners = winners[:]
+    p.last_diversity = diversity_sum / len(winners) if winners else 0.0
     exps = [0.0] * p.n
     tot = 0.0
-    for i in range(k):
-        exps[i] = math.exp(votes[sel[i]] - sv)
+    for i, idx in enumerate(winners):
+        exps[i] = math.exp(votes[idx] - sv)
         tot += exps[i]
-    for i in range(k):
+    for i, idx in enumerate(winners):
         w = exps[i] / tot
         for d in range(p.d_model):
-            result[d] += w * outs[sel[i]][d]
-        p.ex[sel[i]].vitality = 0.88 * p.ex[sel[i]].vitality + 0.12 * abs(w)
-        p.ex[sel[i]].resonance = 0.9 * p.ex[sel[i]].resonance + 0.1 * votes[sel[i]]
-        p.ex[sel[i]].overload = clampf(0.92 * p.ex[sel[i]].overload + 0.18 * max(0.0, w - 0.34), 0.0, 1.0)
-        p.ex[sel[i]].low_steps = 0
-    for i in range(k, p.n):
-        p.ex[sel[i]].vitality = clampf(0.97 * p.ex[sel[i]].vitality + 0.01 * p.ex[sel[i]].resonance, 0.0, 1.0)
-        p.ex[sel[i]].overload *= 0.94
-        p.ex[sel[i]].low_steps += 1
+            result[d] += w * outs[idx][d]
+        p.ex[idx].vitality = 0.86 * p.ex[idx].vitality + 0.14 * abs(w)
+        p.ex[idx].resonance = 0.88 * p.ex[idx].resonance + 0.12 * votes[idx]
+        p.ex[idx].overload = clampf(0.90 * p.ex[idx].overload + 0.20 * max(0.0, w - 0.30), 0.0, 1.0)
+        p.ex[idx].low_steps = 0
+    for idx in range(p.n):
+        if idx in picked:
+            continue
+        recovery = 0.015 + 0.03 * (1.0 - p.ex[idx].overload)
+        p.ex[idx].vitality = clampf(0.96 * p.ex[idx].vitality + recovery * clampf(abs(p.ex[idx].resonance), 0.0, 1.0), 0.0, 1.0)
+        p.ex[idx].overload *= 0.92
+        p.ex[idx].low_steps += 1
     return result
 def parl_inject(p, logits, x, V):
     delta = parl_election(p, x)
@@ -1445,7 +1485,7 @@ def parl_lifecycle(p):
     # apoptosis
     alive = []
     for i in range(p.n):
-        if p.ex[i].low_steps >= 10 and p.ex[i].vitality < 0.08 and p.ex[i].age > 24 and p.n > 2:
+        if p.ex[i].low_steps >= 12 and p.ex[i].vitality < 0.06 and abs(p.ex[i].resonance) < 0.05 and p.ex[i].age > 28 and p.n > 2:
             continue
         alive.append(p.ex[i])
     p.ex = alive
@@ -1455,7 +1495,7 @@ def parl_lifecycle(p):
     for i in range(p.n):
         if p.n + len(births) >= MAX_EXPERTS:
             break
-        if p.ex[i].vitality > 0.72 and p.ex[i].age > 40 and p.ex[i].overload > 0.35:
+        if p.ex[i].vitality > 0.70 and p.ex[i].age > 40 and p.ex[i].overload > 0.32:
             child = Expert()
             expert_init(child, p.ex[i].d_in, p.ex[i].d_out, p.ex[i].rank)
             for j in range(child.rank * child.d_in):
@@ -1466,7 +1506,7 @@ def parl_lifecycle(p):
             child.overload = 0.18
             child.resonance = 0.5 * p.ex[i].resonance
             births.append(child)
-            p.ex[i].vitality *= 0.6
+            p.ex[i].vitality *= 0.62
             p.ex[i].overload *= 0.5
     p.ex.extend(births)
     p.n = len(p.ex)
