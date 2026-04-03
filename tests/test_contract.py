@@ -159,6 +159,26 @@ class UnifiedContractTests(unittest.TestCase):
         self.assertGreater(aged, fresh)
         self.assertGreater(aged, 0.0)
 
+    def test_sqlite_memory_roundtrip(self):
+        mw = q.MetaW()
+        q.ingest_ids(mw, [1, 2, 3, 2, 1], 0.05)
+        q.prophecy_add(mw, 42, 0.7)
+        pt = q.PeriodicTable()
+        pt.build_from_text("resonance rhythm paradox mystery")
+        ch = q.Chambers()
+        ch.feel("warmth in the throat and pressure in the chest", pt)
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "q.sqlite")
+            q.save_memory_sqlite(mw, path, pt, ch)
+            loaded_mw = q.MetaW()
+            loaded_pt = q.PeriodicTable()
+            loaded_ch = q.Chambers()
+            self.assertTrue(q.load_memory_sqlite(loaded_mw, path, loaded_pt, loaded_ch))
+            self.assertGreater(loaded_mw.n_bi, 0)
+            self.assertGreaterEqual(len(loaded_mw.prophecies), 1)
+            self.assertIn("resonance", loaded_pt.elements)
+            self.assertGreater(loaded_ch.presence, 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

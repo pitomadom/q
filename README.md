@@ -119,7 +119,7 @@ The selected chunk then nudges destiny and logits. This is not RAG and not exter
 
 ### Periodic Table (semantic classification)
 
-Every word encountered is classified into one of the 6 chambers by proximity to anchor words. Mass = classification strength. Persists across sessions via `q.memory`. Used by chambers (emotional modulation) and interference (seed selection) to create semantically coherent associations.
+Every word encountered is classified into one of the 6 chambers by proximity to anchor words. Mass = classification strength. Persists across sessions via `q.sqlite` as the circulating organ, with `q.memory` kept as a binary shard snapshot. Used by chambers (emotional modulation) and interference (seed selection) to create semantically coherent associations.
 
 ## Generation Pipeline
 
@@ -150,7 +150,7 @@ A direction vector persists across all 12 steps. Each sentence inherits 30% of g
 
 ### Memory Persistence
 
-`q.memory` — binary file saves/loads MetaWeights between sessions. Q remembers conversations. Bigrams, trigrams, Hebbian associations, **the Periodic Table, and the somatic chamber residue** evolve across runs. Periodic elements (semantic anchors classified by chamber affinity) persist, so Q's vocabulary enriches over time. Somatic state persists as chamber-aligned bodily memory rather than raw text.
+`q.sqlite` is the primary circulating memory organ for the native engines. It stores evolving MetaWeights, the active prophecy field, periodic elements, chamber residue, and session snapshots in structured form. `q.memory` remains as a compact binary shard: fallback, backup, and portable snapshot of the same field. Q remembers through state, not raw transcript replay. Periodic elements (semantic anchors classified by chamber affinity) persist, so Q's vocabulary enriches over time. Somatic state persists as chamber-aligned bodily memory rather than raw text.
 
 ### SPA — Sentence Phonon Attention
 
@@ -186,6 +186,7 @@ python3 postgpt_q.py q.merges q.txt
 # HTML/JS (browser — standalone, no server needed)
 # Open q.html in browser. Click DEMO or drag-drop q.txt. Drag-drop .bin weights for trained mode.
 # Browser memory persists through localStorage, including periodic semantics and somatic state.
+# Native engines also maintain q.sqlite as the primary memory organ and q.memory as a binary shard snapshot.
 ```
 
 Requires: `q.merges` (BPE merge table, binary) and `q.txt` (corpus).
@@ -193,8 +194,8 @@ Requires: `q.merges` (BPE merge table, binary) and `q.txt` (corpus).
 ### Tests
 
 ```bash
-gcc tests/test_all.c -O2 -lm -o test_all && ./test_all    # 35 C tests
-python3 -m unittest tests.test_contract                     # 5 Python contract tests
+gcc tests/test_all.c -O2 -lm -o test_all && ./test_all    # 40 C tests
+python3 -m unittest tests.test_contract                     # 11 Python contract tests
 ```
 
 ## Example Output
@@ -292,7 +293,7 @@ After the initial 12 steps, Q enters interactive mode. Type anything:
   chambers: VOID:10% FLOW:9%
 ```
 
-User input is BPE-encoded and injected into MetaWeights. Keywords modulate somatic chambers, update presence, and leave persistent chamber residue. On exit, evolved MetaWeights are saved to `q.memory`.
+User input is BPE-encoded and injected into MetaWeights. Keywords modulate somatic chambers, update presence, and leave persistent chamber residue. On exit, evolved MetaWeights are saved to `q.sqlite`, with `q.memory` refreshed as the binary shard snapshot.
 
 ## What This Proves
 

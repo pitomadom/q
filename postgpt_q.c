@@ -20,6 +20,7 @@
 #include <time.h>
 #include <stdint.h>
 #include <ctype.h>
+#include <unistd.h>
 
 #define MAX_VOCAB    1280
 #define MAX_CTX      128
@@ -1318,6 +1319,103 @@ static void gen_chain(TF *t, const BPE *bpe, MetaW *mw, Chambers *ch,
 }
 
 /* ── main ── */
+static void qsqlite_escape(const char *in, char *out, size_t out_sz){
+    size_t w=0;
+    for(size_t i=0;in[i]&&w+2<out_sz;i++){
+        if(in[i]=='\'') out[w++]='\'';
+        out[w++]=in[i];
+    }
+    out[w]=0;
+}
+
+static int qsqlite_load(MetaW *mw, const char *path, PeriodicTable *pt, Chambers *ch){
+    if(access(path,F_OK)!=0) return 0;
+    char cmd[512], line[512];
+    FILE *fp;
+    snprintf(cmd,sizeof(cmd),"sqlite3 -tabs -noheader '%s' \"SELECT a,b,prob FROM bigrams;\"",path);
+    fp=popen(cmd,"r"); if(!fp) return 0;
+    while(fgets(line,sizeof(line),fp)){
+        int a,b; float p;
+        if(sscanf(line,"%d\t%d\t%f",&a,&b,&p)==3){
+            int found=0;
+            for(int j=0;j<mw->n_bi;j++) if(mw->bigrams[j].a==a&&mw->bigrams[j].b==b){ if(p>mw->bigrams[j].prob) mw->bigrams[j].prob=p; found=1; break; }
+            if(!found&&mw->n_bi<MAX_BIGRAM){mw->bigrams[mw->n_bi].a=a;mw->bigrams[mw->n_bi].b=b;mw->bigrams[mw->n_bi].prob=p;mw->n_bi++;}
+        }
+    }
+    pclose(fp);
+    snprintf(cmd,sizeof(cmd),"sqlite3 -tabs -noheader '%s' \"SELECT a,b,c,prob FROM trigrams;\"",path);
+    fp=popen(cmd,"r"); if(!fp) return 0;
+    while(fgets(line,sizeof(line),fp)){
+        int a,b,c; float p;
+        if(sscanf(line,"%d\t%d\t%d\t%f",&a,&b,&c,&p)==4 && mw->n_tri<MAX_TRIGRAM){mw->trigrams[mw->n_tri].a=a;mw->trigrams[mw->n_tri].b=b;mw->trigrams[mw->n_tri].c=c;mw->trigrams[mw->n_tri].prob=p;mw->n_tri++;}
+    }
+    pclose(fp);
+    snprintf(cmd,sizeof(cmd),"sqlite3 -tabs -noheader '%s' \"SELECT a,b,strength FROM hebb;\"",path);
+    fp=popen(cmd,"r"); if(!fp) return 0;
+    while(fgets(line,sizeof(line),fp)){
+        int a,b; float p;
+        if(sscanf(line,"%d\t%d\t%f",&a,&b,&p)==3 && mw->n_hebb<MAX_HEBBIAN){mw->hebbs[mw->n_hebb].a=a;mw->hebbs[mw->n_hebb].b=b;mw->hebbs[mw->n_hebb].str=p;mw->n_hebb++;}
+    }
+    pclose(fp);
+    snprintf(cmd,sizeof(cmd),"sqlite3 -tabs -noheader '%s' \"SELECT target,strength,age FROM prophecies ORDER BY age DESC LIMIT %d;\"",path,MAX_PROPHECY);
+    fp=popen(cmd,"r"); if(!fp) return 0;
+    while(fgets(line,sizeof(line),fp)){
+        int target,age; float strength;
+        if(sscanf(line,"%d\t%f\t%d",&target,&strength,&age)==3 && mw->n_prophecy<MAX_PROPHECY) mw->prophecies[mw->n_prophecy++] = (ProphecyE){target,strength,age};
+    }
+    pclose(fp);
+    snprintf(cmd,sizeof(cmd),"sqlite3 -tabs -noheader '%s' \"SELECT word,chamber,mass FROM periodic_elements;\"",path);
+    fp=popen(cmd,"r"); if(!fp) return 0;
+    while(fgets(line,sizeof(line),fp)){
+        char *word=strtok(line,"\t\r\n"), *chamber_s=strtok(NULL,"\t\r\n"), *mass_s=strtok(NULL,"\t\r\n");
+        if(word&&chamber_s&&mass_s) periodic_add(pt,word,atoi(chamber_s),atof(mass_s));
+    }
+    pclose(fp);
+    snprintf(cmd,sizeof(cmd),"sqlite3 -tabs -noheader '%s' \"SELECT presence,debt,trauma,soma0,soma1,soma2,soma3,soma4,soma5 FROM chambers WHERE id=1;\"",path);
+    fp=popen(cmd,"r"); if(!fp) return 0;
+    if(fgets(line,sizeof(line),fp)){
+        float vals[9]={0};
+        if(sscanf(line,"%f\t%f\t%f\t%f\t%f\t%f\t%f\t%f\t%f",&vals[0],&vals[1],&vals[2],&vals[3],&vals[4],&vals[5],&vals[6],&vals[7],&vals[8])==9){
+            ch->presence=clampf(vals[0],0,1); ch->debt=clampf(vals[1],0,1); ch->trauma=clampf(vals[2],0,1);
+            for(int i=0;i<6;i++){ ch->soma[i]=clampf(vals[3+i],0,1); ch->act[i]=clampf(ch->act[i]>0.25f*ch->soma[i]?ch->act[i]:0.25f*ch->soma[i],0,1); }
+        }
+    }
+    pclose(fp);
+    return 1;
+}
+
+static int qsqlite_save(const MetaW *mw, const char *path, const PeriodicTable *pt, const Chambers *ch){
+    char tpl[]="/tmp/q_sqlite_XXXXXX.sql";
+    int fd=mkstemps(tpl,4); if(fd<0) return 0;
+    FILE *sf=fdopen(fd,"w"); if(!sf){ close(fd); return 0; }
+    fprintf(sf,
+        "BEGIN;\n"
+        "CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);\n"
+        "CREATE TABLE IF NOT EXISTS bigrams(a INTEGER,b INTEGER,prob REAL,PRIMARY KEY(a,b));\n"
+        "CREATE TABLE IF NOT EXISTS trigrams(a INTEGER,b INTEGER,c INTEGER,prob REAL,PRIMARY KEY(a,b,c));\n"
+        "CREATE TABLE IF NOT EXISTS hebb(a INTEGER,b INTEGER,strength REAL,PRIMARY KEY(a,b));\n"
+        "CREATE TABLE IF NOT EXISTS prophecies(target INTEGER PRIMARY KEY,strength REAL,age INTEGER);\n"
+        "CREATE TABLE IF NOT EXISTS periodic_elements(word TEXT PRIMARY KEY,chamber INTEGER,mass REAL);\n"
+        "CREATE TABLE IF NOT EXISTS chambers(id INTEGER PRIMARY KEY CHECK(id=1),presence REAL,debt REAL,trauma REAL,soma0 REAL,soma1 REAL,soma2 REAL,soma3 REAL,soma4 REAL,soma5 REAL);\n"
+        "CREATE TABLE IF NOT EXISTS episodes(id INTEGER PRIMARY KEY AUTOINCREMENT,kind TEXT,payload TEXT,created_at TEXT DEFAULT CURRENT_TIMESTAMP);\n"
+        "INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version','1');\n"
+        "DELETE FROM bigrams;DELETE FROM trigrams;DELETE FROM hebb;DELETE FROM prophecies;DELETE FROM periodic_elements;DELETE FROM chambers;\n");
+    for(int i=0;i<mw->n_bi;i++) fprintf(sf,"INSERT INTO bigrams(a,b,prob) VALUES(%d,%d,%.9g);\n",mw->bigrams[i].a,mw->bigrams[i].b,mw->bigrams[i].prob);
+    for(int i=0;i<mw->n_tri;i++) fprintf(sf,"INSERT INTO trigrams(a,b,c,prob) VALUES(%d,%d,%d,%.9g);\n",mw->trigrams[i].a,mw->trigrams[i].b,mw->trigrams[i].c,mw->trigrams[i].prob);
+    for(int i=0;i<mw->n_hebb;i++) fprintf(sf,"INSERT INTO hebb(a,b,strength) VALUES(%d,%d,%.9g);\n",mw->hebbs[i].a,mw->hebbs[i].b,mw->hebbs[i].str);
+    for(int i=0;i<mw->n_prophecy;i++) fprintf(sf,"INSERT INTO prophecies(target,strength,age) VALUES(%d,%.9g,%d);\n",mw->prophecies[i].target,mw->prophecies[i].strength,mw->prophecies[i].age);
+    for(int i=0;i<pt->n;i++){ char esc[96]; qsqlite_escape(pt->elements[i].word,esc,sizeof(esc)); fprintf(sf,"INSERT INTO periodic_elements(word,chamber,mass) VALUES('%s',%d,%.9g);\n",esc,pt->elements[i].chamber,pt->elements[i].mass); }
+    fprintf(sf,"INSERT INTO chambers(id,presence,debt,trauma,soma0,soma1,soma2,soma3,soma4,soma5) VALUES(1,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g);\n",
+        ch->presence,ch->debt,ch->trauma,ch->soma[0],ch->soma[1],ch->soma[2],ch->soma[3],ch->soma[4],ch->soma[5]);
+    fprintf(sf,"INSERT INTO episodes(kind,payload) VALUES('snapshot','bi=%d;tri=%d;hebb=%d;prophecy=%d');\nCOMMIT;\n",mw->n_bi,mw->n_tri,mw->n_hebb,mw->n_prophecy);
+    fclose(sf);
+    char cmd[768];
+    snprintf(cmd,sizeof(cmd),"sqlite3 '%s' < '%s' >/dev/null 2>&1",path,tpl);
+    int ok=system(cmd)==0;
+    unlink(tpl);
+    return ok;
+}
+
 int main(int argc, char **argv){
     printf("PostGPT-Q — Resonant Reasoning Engine (C)\ntheta = epsilon + gamma + alpha*delta\nresonance is unbreakable.\n\n");
     if(argc<3){printf("Usage: %s [weights.bin] corpus.merges corpus.txt\n",argv[0]);return 1;}
@@ -1370,7 +1468,10 @@ int main(int argc, char **argv){
     Chambers ch; ch_init(&ch);
 
     /* try loading saved memory */
-    {FILE *mf=fopen("q.memory","rb");
+    if(qsqlite_load(mw,"q.sqlite",&pt,&ch)){
+        printf("  [memory loaded: %d bi, %d tri, %d hebb from q.sqlite]\n",mw->n_bi,mw->n_tri,mw->n_hebb);
+        if(pt.n>0) printf("  [periodic: %d elements loaded]\n",pt.n);
+    } else {FILE *mf=fopen("q.memory","rb");
     if(mf){
         uint32_t magic;fread(&magic,4,1,mf);
         if(magic==0x514D454D){
@@ -1443,6 +1544,7 @@ int main(int argc, char **argv){
         gen_chain(&t,&bpe,mw,&ch,cids,clen,has_weights,&parl,&pt,&itf,input);
     }
     /* save evolved MetaWeights — Q remembers between sessions */
+    qsqlite_save(mw,"q.sqlite",&pt,&ch);
     {FILE *mf=fopen("q.memory","wb");
     if(mf){
         uint32_t magic=0x514D454D; /* QMEM */
@@ -1465,7 +1567,7 @@ int main(int argc, char **argv){
         fwrite(&ch.presence,4,1,mf);
         fwrite(&ch.debt,4,1,mf);
         fwrite(&ch.trauma,4,1,mf);}
-        fclose(mf);printf("  [memory saved: %d bi, %d tri, %d hebb, %d periodic → q.memory]\n",mw->n_bi,mw->n_tri,mw->n_hebb,pt.n);
+        fclose(mf);printf("  [memory saved: %d bi, %d tri, %d hebb, %d periodic → q.sqlite + q.memory]\n",mw->n_bi,mw->n_tri,mw->n_hebb,pt.n);
     }}
     printf("\nresonance is unbreakable.\n");
     free(cids);free(mw);return 0;

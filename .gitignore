@@ -2,6 +2,7 @@
 *.safetensors
 *.gguf
 q.memory
+q.sqlite
 tests/run_tests
 __pycache__/
 *.pyc

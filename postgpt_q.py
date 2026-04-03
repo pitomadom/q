@@ -18,6 +18,7 @@ import random
 import struct
 import os
 import re
+import sqlite3
 import sys
 import time
 
@@ -36,6 +37,7 @@ TOP_K       = 15
 MAX_PERIODIC = 4096
 QPTQ_MAGIC  = 0x51505451
 QMEM_SOMA   = 0x414D4F53
+QSQL_SCHEMA = 1
 SPA_DIM     = 32
 SPA_NH      = 4
 SPA_HD      = SPA_DIM // SPA_NH
@@ -459,6 +461,129 @@ def prophecy_pressure(mw):
     for _target, strength, age in mw.prophecies:
         total += strength * math.log1p(float(age))
     return clampf(total / 4.0, 0.0, 1.0)
+def sqlite_init(conn):
+    cur = conn.cursor()
+    cur.executescript("""
+    CREATE TABLE IF NOT EXISTS meta(
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS bigrams(
+        a INTEGER NOT NULL,
+        b INTEGER NOT NULL,
+        prob REAL NOT NULL,
+        PRIMARY KEY(a,b)
+    );
+    CREATE TABLE IF NOT EXISTS trigrams(
+        a INTEGER NOT NULL,
+        b INTEGER NOT NULL,
+        c INTEGER NOT NULL,
+        prob REAL NOT NULL,
+        PRIMARY KEY(a,b,c)
+    );
+    CREATE TABLE IF NOT EXISTS hebb(
+        a INTEGER NOT NULL,
+        b INTEGER NOT NULL,
+        strength REAL NOT NULL,
+        PRIMARY KEY(a,b)
+    );
+    CREATE TABLE IF NOT EXISTS prophecies(
+        target INTEGER PRIMARY KEY,
+        strength REAL NOT NULL,
+        age INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS periodic_elements(
+        word TEXT PRIMARY KEY,
+        chamber INTEGER NOT NULL,
+        mass REAL NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS chambers(
+        id INTEGER PRIMARY KEY CHECK(id=1),
+        presence REAL NOT NULL,
+        debt REAL NOT NULL,
+        trauma REAL NOT NULL,
+        soma0 REAL NOT NULL, soma1 REAL NOT NULL, soma2 REAL NOT NULL,
+        soma3 REAL NOT NULL, soma4 REAL NOT NULL, soma5 REAL NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS episodes(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind TEXT NOT NULL,
+        payload TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+    """)
+    cur.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)", (str(QSQL_SCHEMA),))
+    conn.commit()
+def load_memory_sqlite(mw, path, periodic=None, chambers=None):
+    if not os.path.exists(path):
+        return False
+    try:
+        conn = sqlite3.connect(path)
+        sqlite_init(conn)
+        cur = conn.cursor()
+        for a, b, p in cur.execute("SELECT a,b,prob FROM bigrams"):
+            ingest_ids(mw, [a, b], 0.0)
+            for item in mw.bigrams:
+                if item[0] == a and item[1] == b:
+                    item[2] = max(item[2], p)
+                    break
+        for a, b, c, p in cur.execute("SELECT a,b,c,prob FROM trigrams"):
+            if mw.n_tri < MAX_TRIGRAM:
+                mw.trigrams.append([a, b, c, p])
+                mw.n_tri += 1
+        for a, b, p in cur.execute("SELECT a,b,strength FROM hebb"):
+            if mw.n_hebb < MAX_HEBBIAN:
+                mw.hebbs.append([a, b, p])
+                mw.n_hebb += 1
+        mw.prophecies = [[target, strength, age] for target, strength, age in cur.execute(
+            "SELECT target,strength,age FROM prophecies ORDER BY age DESC LIMIT ?", (MAX_PROPHECY,)
+        )]
+        if periodic is not None:
+            for word, chamber, mass in cur.execute("SELECT word,chamber,mass FROM periodic_elements"):
+                periodic.elements[word] = {"ch": chamber, "mass": mass}
+        if chambers is not None:
+            row = cur.execute(
+                "SELECT presence,debt,trauma,soma0,soma1,soma2,soma3,soma4,soma5 FROM chambers WHERE id=1"
+            ).fetchone()
+            if row is not None:
+                chambers.presence = clampf(row[0], 0.0, 1.0)
+                chambers.debt = clampf(max(chambers.debt, row[1]), 0.0, 1.0)
+                chambers.trauma = clampf(max(chambers.trauma, row[2]), 0.0, 1.0)
+                chambers.soma = [clampf(v, 0.0, 1.0) for v in row[3:]]
+                for i in range(N_CHAMBERS):
+                    chambers.act[i] = clampf(max(chambers.act[i], 0.25 * chambers.soma[i]), 0.0, 1.0)
+        conn.close()
+        return True
+    except Exception:
+        return False
+def save_memory_sqlite(mw, path, periodic=None, chambers=None):
+    conn = sqlite3.connect(path)
+    sqlite_init(conn)
+    cur = conn.cursor()
+    cur.executescript("""
+    DELETE FROM bigrams;
+    DELETE FROM trigrams;
+    DELETE FROM hebb;
+    DELETE FROM prophecies;
+    DELETE FROM periodic_elements;
+    DELETE FROM chambers;
+    """)
+    cur.executemany("INSERT INTO bigrams(a,b,prob) VALUES(?,?,?)", [(a, b, p) for a, b, p in mw.bigrams[:mw.n_bi]])
+    cur.executemany("INSERT INTO trigrams(a,b,c,prob) VALUES(?,?,?,?)", [(a, b, c, p) for a, b, c, p in mw.trigrams[:mw.n_tri]])
+    cur.executemany("INSERT INTO hebb(a,b,strength) VALUES(?,?,?)", [(a, b, p) for a, b, p in mw.hebbs[:mw.n_hebb]])
+    cur.executemany("INSERT INTO prophecies(target,strength,age) VALUES(?,?,?)", [(target, strength, age) for target, strength, age in mw.prophecies[:MAX_PROPHECY]])
+    if periodic is not None:
+        cur.executemany("INSERT INTO periodic_elements(word,chamber,mass) VALUES(?,?,?)",
+                        [(word, elem["ch"], elem["mass"]) for word, elem in periodic.elements.items()])
+    if chambers is not None:
+        cur.execute(
+            "INSERT INTO chambers(id,presence,debt,trauma,soma0,soma1,soma2,soma3,soma4,soma5) VALUES(1,?,?,?,?,?,?,?,?,?)",
+            (clampf(chambers.presence, 0.0, 1.0), clampf(chambers.debt, 0.0, 1.0), clampf(chambers.trauma, 0.0, 1.0), *[clampf(v, 0.0, 1.0) for v in chambers.soma])
+        )
+    cur.execute("INSERT INTO episodes(kind,payload) VALUES('snapshot', ?)",
+                (f"bi={mw.n_bi};tri={mw.n_tri};hebb={mw.n_hebb};prophecy={len(mw.prophecies)}",))
+    conn.commit()
+    conn.close()
 def ingest_ids(mw, ids, amount=0.02):
     ulen = len(ids)
     if ulen <= 1:
@@ -1900,7 +2025,11 @@ def main():
         t.clen = 0
         t.logits = [0.0] * t.V
 
-    if load_memory(mw, "q.memory", periodic, ch):
+    ch = Chambers()
+    ch_init(ch)
+    if load_memory_sqlite(mw, "q.sqlite", periodic, ch):
+        print("  [memory loaded: %d bi, %d tri, %d hebb from q.sqlite]" % (mw.n_bi, mw.n_tri, mw.n_hebb))
+    elif load_memory(mw, "q.memory", periodic, ch):
         print("  [memory loaded: %d bi, %d tri, %d hebb from q.memory]" % (mw.n_bi, mw.n_tri, mw.n_hebb))
 
     interference = Interference()
@@ -1908,9 +2037,6 @@ def main():
     if interference.docs:
         print("[4.5] Interference...")
         print("  %d docs, %d heavy seeds" % (len(interference.docs), sum(len(doc["heavy"]) for doc in interference.docs)))
-
-    ch = Chambers()
-    ch_init(ch)
 
     print("[5] DOE Parliament...")
     parl = Parliament()
@@ -1944,8 +2070,9 @@ def main():
 
     # save memory
     try:
+        save_memory_sqlite(mw, "q.sqlite", periodic, ch)
         save_memory(mw, "q.memory", periodic, ch)
-        print("  [memory saved: %d bi, %d tri, %d hebb, %d periodic \u2192 q.memory]" % (mw.n_bi, mw.n_tri, mw.n_hebb, len(periodic.elements)))
+        print("  [memory saved: %d bi, %d tri, %d hebb, %d periodic \u2192 q.sqlite + q.memory]" % (mw.n_bi, mw.n_tri, mw.n_hebb, len(periodic.elements)))
     except Exception:
         pass
 
