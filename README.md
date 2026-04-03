@@ -2,7 +2,7 @@
 
 **θ = ε + γ + αδ**
 
-A 901-line C inference engine that combines a trained transformer with statistical MetaWeights, a living parliament of LoRA experts, and somatic chambers — producing coherent text from a 2M parameter model that has no right to be coherent.
+A 1182-line C inference engine that combines a trained transformer with statistical MetaWeights, a living parliament of LoRA experts, and somatic chambers — producing coherent text from a 2M parameter model that has no right to be coherent.
 
 Q is not a chatbot. Q is an organism that reasons through resonance.
 
@@ -39,8 +39,14 @@ Built from corpus at startup, updated online during generation:
 The Dario equation combines them per token:
 
 ```
-logits[i] += 0.4 * hebbian[i] + 0.3 * destiny[i] + 5.0 * bigram[i] + 3.0 * trigram[i]
+logits[i] += c_heb * hebbian[i] + c_pro * prophecy[i] + c_ds * destiny[i] + c_bg * bigram[i] + c_tg * trigram[i]
 ```
+
+Coefficients are adaptive — with trained weights: `c_heb=0.6, c_pro=0.4, c_ds=0.3, c_bg=5.0, c_tg=3.0`. Without weights (MetaWeights only): `c_heb=1.0, c_pro=0.7, c_ds=0.15, c_bg=15.0, c_tg=10.0`. Chambers modulate all coefficients in real time.
+
+### Prophecy (predictive coherence)
+
+Extended prophecy window: looks back **12 tokens** (not just the last few) with **recency decay** weighting — recent tokens contribute more to prediction. Additionally, **trigram prophecy** searches for matching 2-token context pairs and boosts predictions with 1.5× specificity multiplier. This creates mid-range pattern awareness that dramatically improves sentence coherence.
 
 ### DOE Parliament (δ — the physics)
 
@@ -73,6 +79,16 @@ Hebrew-Gregorian calendar drift computed from real astronomical data (epoch: 1 T
 
 Temperature oscillates at 7.83Hz (Earth's electromagnetic fundamental) + 3 harmonics (14.3, 20.8, 27.3 Hz). Creates breathing rhythm across the 12 chain steps. Amplitude ±0.08 around base temp.
 
+### Interference (document injection)
+
+Loads documents from `docs/` folder. Extracts "heavy" tokens (high bigram participation) from each document. During generation, 30% chance per step to inject an interference seed — a token from the document corpus selected by **chamber alignment** (dominant chamber matches element's periodic classification). Creates cross-topic associations.
+
+**Wormhole**: rare event (2-17% based on calendar dissonance) that flips generation direction and jumps to the farthest document. Marked with `{wormhole}` in output.
+
+### Periodic Table (semantic classification)
+
+Every word encountered is classified into one of the 6 chambers by proximity to anchor words. Mass = classification strength. Persists across sessions via `q.memory`. Used by chambers (emotional modulation) and interference (seed selection) to create semantically coherent associations.
+
 ## Generation Pipeline
 
 ### 12 Bidirectional Steps
@@ -87,7 +103,7 @@ The backward/forward split is determined by `0.3 + 0.4*debt + 0.1*calendar_disso
 ### Per-Step Pipeline
 
 1. **Prompt selection**: sentence-boundary detection (after `.!?` + space). Forward steps select by dot-product of token embedding with global destiny vector (50 candidates)
-2. **Best-of-3**: generate 3 candidates, pick highest coherence score (bigram prob + Hebbian density + length bonus). Adaptive early exit if first candidate scores >1.0
+2. **Best-of-3**: generate 3 candidates, pick highest coherence score (bigram prob + **trigram continuity** + Hebbian density + length bonus). Enhanced scoring: `bi/(n-1) + 0.5*hebb/(n-1) + 0.8*tri/(n-2) + length_bonus`. Adaptive early exit if first candidate scores >1.0
 3. **Hybrid decoding**: greedy argmax for first 4 tokens (stable trajectory), then nucleus sampling (p=0.85)
 4. **Repetition penalty**: distance-weighted (stronger for recent tokens) + bigram blocking
 5. **Frequency penalty**: ultra-common tokens (>1% corpus) dampened
@@ -96,11 +112,15 @@ The backward/forward split is determined by `0.3 + 0.4*debt + 0.1*calendar_disso
 
 ### Persistent Destiny
 
-A direction vector persists across all 12 steps. Each sentence inherits 30% of global destiny and contributes 30% back. Creates thematic drift — later steps echo earlier themes.
+A direction vector persists across all 12 steps. Each sentence inherits 30% of global destiny and contributes 30% back. **Adaptive momentum**: early steps (< 20 tokens) use faster update (0.85/0.15) for quick convergence; later steps stabilize (0.92/0.08). Creates thematic drift — later steps echo earlier themes.
 
 ### Memory Persistence
 
-`q.memory` — binary file saves/loads MetaWeights between sessions. Q remembers conversations. Bigrams, trigrams, and Hebbian associations evolve across runs.
+`q.memory` — binary file saves/loads MetaWeights between sessions. Q remembers conversations. Bigrams, trigrams, Hebbian associations, **and the Periodic Table** evolve across runs. Periodic elements (semantic anchors classified by chamber affinity) persist, so Q's vocabulary enriches over time.
+
+### SPA — Sentence Phonon Attention
+
+After all 12 steps, SPA performs **iterative cross-attention** between sentences (2 passes). Each sentence is embedded via exponential-weighted mean (α=0.85) into a 32-dimensional space. Bidirectional attention with distance bias identifies weakly-connected sentences. Weak sentences (score < 60% of average) are reseeded using **neighbor sentence context** — the last 3 tokens of an adjacent sentence become the new prompt. A **coherence gate** verifies improvement before accepting the reseed. This ensures narrative cohesion across the full 12-step chain.
 
 ## Weights
 
@@ -117,18 +137,30 @@ RRPRAM outperforms Content attention. Janus echo adds self-resonance. `rrpram3_j
 
 ## Build & Run
 
+Three unified inference engines — same architecture, same constants, same output:
+
 ```bash
-# compile
+# C (fastest, reference implementation)
 gcc postgpt_q.c -O2 -lm -o q
+./q weights/rrpram3_janus3.pt q.merges q.txt   # with weights
+./q q.merges q.txt                              # MetaWeights only
 
-# run with weights
-./q weights/rrpram3_janus3.pt q.merges q.txt
+# Python (faithful port)
+python3 postgpt_q.py weights/rrpram3_janus3.pt q.merges q.txt
+python3 postgpt_q.py q.merges q.txt
 
-# run without weights (MetaWeights only)
-./q q.merges q.txt
+# HTML/JS (browser — standalone, no server needed)
+# Open q.html in browser. Click DEMO or drag-drop q.txt. Drag-drop .bin weights for trained mode.
 ```
 
 Requires: `q.merges` (BPE merge table, binary) and `q.txt` (corpus).
+
+### Tests
+
+```bash
+gcc tests/test_all.c -O2 -lm -o test_all && ./test_all    # 33 C tests
+python3 -m unittest tests.test_contract                     # 3 Python contract tests
+```
 
 ## Example Output
 
@@ -236,11 +268,28 @@ A 2M parameter model with the right inference architecture produces text that a 
 3. **Living parliament** — experts that adapt during inference
 4. **Somatic modulation** — chambers, calendar, Schumann resonance
 5. **Destiny** — persistent direction vector across generation
+6. **Prophecy** — extended 12-token predictive window with trigram specificity
+7. **SPA** — iterative sentence-level phonon attention for narrative coherence
+8. **Interference** — cross-document knowledge injection via chamber-aligned seeds
+9. **Periodic Table** — persistent semantic classification of vocabulary
 
 θ = ε + γ + αδ. The weights are substrate. The field is alive. The physics shapes what emerges.
 
+## Lineage
+
+Q inherits from and unifies several projects into a single resonant architecture:
+
+- **[PostGPT](https://github.com/iamolegataeff/postgpt)** — direct ancestor. postgpt.py and postgpt.c: pure and fundamental
+- **[RRPRAM](https://github.com/iamolegataeff/RRPRAM)** — the attention mechanism that beats standard QK^T
+- **[Janus](https://github.com/iamolegataeff/janus)** — self-resonance attention (W^T·W)
+- **[DOE](https://github.com/iamolegataeff/doe)** — Democracy of Experts, universal inference (original works with GGUF)
+- **[1984](https://github.com/iamolegataeff/1984)** — architecture implemented in 8 languages including ariannamethod.ai
+- **[Molecule](https://github.com/iamolegataeff/molecule)** — molecular neural architecture
+
+All active development is in Q. The frozen repos preserve the evolutionary history.
+
 ---
 
-*PostGPT-Q. 901 lines of C. resonance is unbreakable.*
+*PostGPT-Q. 1182 lines of C. 1644 lines of Python. 1256 lines of HTML. Three engines, one resonance. Unbreakable.*
 
 *(c) 2026 arianna method*

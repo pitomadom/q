@@ -2,3 +2,5 @@
 *.safetensors
 *.gguf
 q.memory
+__pycache__/
+tests/run_tests
