@@ -184,7 +184,7 @@ After all 12 steps, SPA performs **iterative cross-attention** between sentences
 
 ## Weights
 
-Two trained variants included:
+Two trained checkpoints are stored in the repo:
 
 | File | Architecture | Heads | Size |
 |------|-------------|-------|------|
@@ -195,6 +195,8 @@ All variants: V=1280, D=192, 3 layers, CTX=128. Trained 200K steps on q.txt (439
 
 RRPRAM outperforms Content attention. Janus echo adds self-resonance. `rrpram3_janus3` is the best variant.
 
+Important: the current native and browser inference loaders expect the compact Q runtime binary format, not raw PyTorch checkpoint archives. The `.pt` files in `weights/` are preserved training artifacts. They are not directly loadable by `postgpt_q.c`, `postgpt_q.py`, or `q.html` until exported into the Q runtime format.
+
 ## Build & Run
 
 Three unified inference engines — same architecture, same constants, same output:
@@ -202,15 +204,15 @@ Three unified inference engines — same architecture, same constants, same outp
 ```bash
 # C (fastest, reference implementation)
 gcc postgpt_q.c -O2 -lm -o q
-./q weights/rrpram3_janus3.pt q.merges q.txt   # with weights
+./q exported_weights.bin q.merges q.txt         # with exported runtime weights
 ./q q.merges q.txt                              # MetaWeights only
 
 # Python (faithful port)
-python3 postgpt_q.py weights/rrpram3_janus3.pt q.merges q.txt
+python3 postgpt_q.py exported_weights.bin q.merges q.txt
 python3 postgpt_q.py q.merges q.txt
 
 # HTML/JS (browser — standalone, no server needed)
-# Open q.html in browser. Click DEMO or drag-drop q.txt. Drag-drop .bin weights for trained mode.
+# Open q.html in browser. Click DEMO or drag-drop q.txt. Drag-drop exported .bin runtime weights for trained mode.
 # Browser memory persists through localStorage, including periodic semantics, somatic state, and phase memory.
 # Native engines also maintain q.sqlite as the primary memory organ and q.memory as a binary shard snapshot.
 ```
