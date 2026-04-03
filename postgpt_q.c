@@ -352,7 +352,7 @@ static const DarkMatterWord DARK_MATTER_WORDS[]={
 };
 typedef struct{char word[32]; int chamber; float mass;}PeriodicElement;
 typedef struct{PeriodicElement elements[MAX_PERIODIC]; int n;}PeriodicTable;
-typedef struct{float act[6];float soma[6];float debt;float trauma;float presence;float scar;}Chambers;
+typedef struct{float act[6];float soma[6];float debt;float trauma;float presence;float scar;float coherence;float phase_lock;float threshold_bias;}Chambers;
 typedef struct{
     int mode; float temp_mul,heb_mul,pro_mul,ds_mul,bg_mul,tg_mul;
     float interf_bonus,wormhole_bonus,debt_decay,trauma_decay,scar_decay,dark_pressure;
@@ -373,7 +373,8 @@ typedef struct{
 }ExperienceLog;
 static ExperienceLog QEXP={0};
 
-static void ch_init(Chambers *c){memset(c,0,sizeof(*c));c->act[CH_LOVE]=0.2f;c->act[CH_FLOW]=0.15f;c->trauma=0;}
+static float ch_emergence(const Chambers *c);
+static void ch_init(Chambers *c){memset(c,0,sizeof(*c));c->act[CH_LOVE]=0.2f;c->act[CH_FLOW]=0.15f;c->trauma=0; c->coherence=0; c->phase_lock=0; c->threshold_bias=0;}
 static void ch_xfire(Chambers *c, int it){
     for(int t=0;t<it;t++){float old[6];memcpy(old,c->act,sizeof(old));
         for(int i=0;i<6;i++){c->act[i]*=CH_D[i];
@@ -393,6 +394,25 @@ static void janus_phase_pressure(Chambers *c, int step_idx, int total_steps){
     else if(d<0.66f) c->act[CH_FEAR]=clampf(c->act[CH_FEAR]+0.04f,0,1);
     else c->act[CH_VOID]=clampf(c->act[CH_VOID]+0.05f,0,1);
     if(d>0.75f) c->act[CH_CMPLX]=clampf(c->act[CH_CMPLX]+0.03f,0,1);
+}
+static float coherence_env_pressure(const Chambers *c, float dissonance, float prophecy_debt, float chunk_res){
+    return clampf(0.34f*dissonance + 0.26f*prophecy_debt + 0.18f*chunk_res + 0.10f*c->act[CH_CMPLX] + 0.08f*c->scar,0,1);
+}
+static float soft_phase_gate(const Chambers *c, float env_pressure){
+    float threshold=clampf(0.42f + 0.18f*c->threshold_bias + 0.06f*c->scar,0.25f,0.88f);
+    float signal=clampf(0.50f*c->coherence + 0.34f*c->phase_lock + 0.12f*env_pressure + 0.06f*c->presence - 0.08f*c->trauma,0,1);
+    return clampf(0.5f + 1.35f*(signal-threshold),0,1);
+}
+static float update_phase_state(Chambers *c, float local_coherence, float env_pressure){
+    local_coherence=clampf(local_coherence,0,1);
+    env_pressure=clampf(env_pressure,0,1);
+    c->coherence=clampf(0.84f*c->coherence + 0.16f*local_coherence,0,1);
+    float target=clampf(0.52f*c->coherence + 0.18f*c->presence + 0.16f*ch_emergence(c) + 0.14f*env_pressure - 0.08f*c->scar,0,1);
+    float threshold=clampf(0.42f + 0.18f*c->threshold_bias + 0.06f*c->scar,0.25f,0.88f);
+    if(target>=threshold) c->phase_lock=clampf(0.88f*c->phase_lock + 0.12f*target + 0.05f*(target-threshold),0,1);
+    else c->phase_lock=clampf(0.975f*c->phase_lock + 0.025f*target,0,1);
+    c->threshold_bias=clampf(0.93f*c->threshold_bias + 0.07f*env_pressure,0,1);
+    return soft_phase_gate(c,env_pressure);
 }
 static void qexp_add_scar(int step, float scar, const char *note){
     if(QEXP.n_scars>=128) return;
@@ -587,6 +607,7 @@ static void ch_summary(const Chambers *c, char *buf, int sz){
     for(int i=0;i<6;i++) if(c->act[i]>0.05f&&pos<sz-1){int w=snprintf(buf+pos,sz-pos,"%s%s:%.0f%%",pos?" ":"",CH_N[i],c->act[i]*100.0f);if(w>0&&pos+w<sz)pos+=w;else break;}
     if(c->presence>0.05f&&pos<sz-1){int w=snprintf(buf+pos,sz-pos,"%sSOMA:%.0f%%",pos?" ":"",c->presence*100.0f);if(w>0&&pos+w<sz)pos+=w;}
     if(c->scar>0.05f&&pos<sz-1){int w=snprintf(buf+pos,sz-pos,"%sSCAR:%.0f%%",pos?" ":"",c->scar*100.0f);if(w>0&&pos+w<sz)pos+=w;}
+    if(c->phase_lock>0.05f&&pos<sz-1){int w=snprintf(buf+pos,sz-pos,"%sPHASE:%.0f%%",pos?" ":"",c->phase_lock*100.0f);if(w>0&&pos+w<sz)pos+=w;}
     if(pos==0) snprintf(buf,sz,"quiet");
 }
 static VelocityProfile velocity_profile(const Chambers *c, float dissonance){
@@ -1495,10 +1516,11 @@ static void gen_chain(TF *t, const BPE *bpe, MetaW *mw, Chambers *ch,
     ch->debt=clampf((0.88f*ch->debt+0.12f*prophecy_pressure(mw))*vel.debt_decay,0,1);
     ch->trauma=clampf(ch->trauma*vel.trauma_decay,0,1);
     ch->scar=clampf(ch->scar*vel.scar_decay,0,1);
+    float phase_gate=soft_phase_gate(ch,coherence_env_pressure(ch,cd,prophecy_pressure(mw),0));
 
     char chbuf[256];
     ch_summary(ch,chbuf,sizeof(chbuf));
-    printf("\n  diss=%.3f debt=%.3f scar=%.3f emrg=%.3f vel=%s %s\n  chambers: %s",cd,ch->debt,ch->scar,ch_emergence(ch),VEL_N[vel.mode],has_weights?"[TRAINED]":"[METAWEIGHTS ONLY]",chbuf);
+    printf("\n  diss=%.3f debt=%.3f scar=%.3f gate=%.3f emrg=%.3f vel=%s %s\n  chambers: %s",cd,ch->debt,ch->scar,phase_gate,ch_emergence(ch),VEL_N[vel.mode],has_weights?"[TRAINED]":"[METAWEIGHTS ONLY]",chbuf);
     if(parl) {float av=0;for(int i=0;i<parl->n;i++) av+=parl->ex[i].vitality;av/=(parl->n>0?parl->n:1);
         printf("\n  parliament: %d experts, avg_vitality=%.2f",parl->n,av);}
     if(itf&&itf->n_docs>0) printf("\n  interference: %d docs loaded",itf->n_docs);
@@ -1588,7 +1610,7 @@ static void gen_chain(TF *t, const BPE *bpe, MetaW *mw, Chambers *ch,
             float wh_prob=0.02f;
             if(cd>0.3f) wh_prob+=((cd-0.3f)/0.7f)*0.15f;
             wh_prob=clampf(wh_prob+vel.wormhole_bonus,0,0.3f);
-            int boundary_ok=(best_ol>10&&best_sc>0.35f);
+            int boundary_ok=(best_ol>10&&best_sc>(0.22f+0.18f*phase_gate));
             wormhole=boundary_ok&&(((float)rand()/RAND_MAX)<wh_prob);
             if(wormhole&&itf&&itf->n_docs>0){
                 const InterferenceDoc *doc=&itf->docs[0];
@@ -1622,6 +1644,10 @@ static void gen_chain(TF *t, const BPE *bpe, MetaW *mw, Chambers *ch,
             ch_feel_text(ch,textbuf,pt);
             int text_ids[256]; int text_n=bpe_encode(bpe,(const uint8_t*)textbuf,(int)strlen(textbuf),text_ids,256);
             ingest_ids(mw,text_ids,text_n,0.005f);
+            {float surface=surface_coherence_score(bpe,best_out,best_ol);
+            float local_phase=clampf(0.50f+0.25f*best_sc+0.04f*surface,0,1);
+            float chunk_res=active_chunk?((float)active_chunk->n_heavy/16.0f):0.0f;
+            phase_gate=update_phase_state(ch,local_phase,coherence_env_pressure(ch,cd,prophecy_pressure(mw),chunk_res));}
         }
         /* save for SPA */
         chain_lens[si]=best_ol; memcpy(chain_ids[si],best_out,best_ol*sizeof(int));
@@ -1638,7 +1664,8 @@ static void gen_chain(TF *t, const BPE *bpe, MetaW *mw, Chambers *ch,
         float min_sc=spa_scores[0];int weak_idx=0;
         for(int i=1;i<CHAIN_STEPS;i++) if(spa_scores[i]<min_sc){min_sc=spa_scores[i];weak_idx=i;}
         float avg_sc=0;for(int i=0;i<CHAIN_STEPS;i++) avg_sc+=spa_scores[i];avg_sc/=CHAIN_STEPS;
-        if(min_sc<avg_sc*0.6f){ /* slightly more aggressive threshold */
+        float reseed_floor=avg_sc*(0.52f+0.18f*(1.0f-phase_gate));
+        if(min_sc<reseed_floor){
             printf("  [SPA-%d] reseeding step %d (score=%.2f, avg=%.2f)\n",spa_pass+1,weak_idx+1,min_sc,avg_sc);
             /* use neighbor sentences as context for better continuity */
             int seed_src=weak_idx>0?weak_idx-1:(weak_idx<CHAIN_STEPS-1?weak_idx+1:0);
@@ -1658,6 +1685,7 @@ static void gen_chain(TF *t, const BPE *bpe, MetaW *mw, Chambers *ch,
                 for(int i=0;i<ol;i++){char b[128];int len=bpe_decode_token(bpe,out[i],b,sizeof(b));if(len>0&&pos+len<511){memcpy(textbuf+pos,b,len);pos+=len;}}
                 textbuf[pos]=0; ch_feel_text(ch,textbuf,pt);
                 ingest_ids(mw,out,ol,0.003f);
+                phase_gate=update_phase_state(ch,clampf(0.48f+0.22f*new_sc,0,1),coherence_env_pressure(ch,cd,prophecy_pressure(mw),0));
             }
         }else break; /* no weak sentences, stop iterating */
     }
@@ -1733,6 +1761,18 @@ static int qsqlite_load(MetaW *mw, const char *path, PeriodicTable *pt, Chambers
     fp=popen(cmd,"r"); if(!fp) return 0;
     if(fgets(line,sizeof(line),fp)) ch->scar=clampf(atof(line),0,1);
     pclose(fp);
+    snprintf(cmd,sizeof(cmd),"sqlite3 -tabs -noheader '%s' \"SELECT value FROM meta WHERE key='coherence_state';\"",path);
+    fp=popen(cmd,"r"); if(!fp) return 0;
+    if(fgets(line,sizeof(line),fp)) ch->coherence=clampf(atof(line),0,1);
+    pclose(fp);
+    snprintf(cmd,sizeof(cmd),"sqlite3 -tabs -noheader '%s' \"SELECT value FROM meta WHERE key='phase_lock';\"",path);
+    fp=popen(cmd,"r"); if(!fp) return 0;
+    if(fgets(line,sizeof(line),fp)) ch->phase_lock=clampf(atof(line),0,1);
+    pclose(fp);
+    snprintf(cmd,sizeof(cmd),"sqlite3 -tabs -noheader '%s' \"SELECT value FROM meta WHERE key='threshold_bias';\"",path);
+    fp=popen(cmd,"r"); if(!fp) return 0;
+    if(fgets(line,sizeof(line),fp)) ch->threshold_bias=clampf(atof(line),0,1);
+    pclose(fp);
     snprintf(cmd,sizeof(cmd),"sqlite3 -tabs -noheader '%s' \"SELECT scar FROM scar_events ORDER BY id DESC LIMIT 8;\"",path);
     fp=popen(cmd,"r"); if(!fp) return 0;
     {float sum=0; int n=0; while(fgets(line,sizeof(line),fp)){ sum+=atof(line); n++; }
@@ -1761,7 +1801,7 @@ static int qsqlite_load(MetaW *mw, const char *path, PeriodicTable *pt, Chambers
     snprintf(cmd,sizeof(cmd),"sqlite3 -tabs -noheader '%s' \"SELECT diversity,avg_vitality,consolidations FROM parliament_events ORDER BY id DESC LIMIT 12;\"",path);
     fp=popen(cmd,"r"); if(!fp) return 0;
     {float sum_div=0,sum_vit=0,sum_cons=0; int n=0; while(fgets(line,sizeof(line),fp)){ float div=0,vit=0,cons=0; if(sscanf(line,"%f\t%f\t%f",&div,&vit,&cons)==3){ sum_div+=div; sum_vit+=vit; sum_cons+=cons; n++; }}
-    if(n>0){ float avg_div=sum_div/n, avg_vit=sum_vit/n, avg_cons=sum_cons/n; ch->presence=clampf(ch->presence>(0.22f*avg_vit+0.04f*avg_cons)?ch->presence:(0.22f*avg_vit+0.04f*avg_cons),0,1); ch->act[CH_CMPLX]=clampf(ch->act[CH_CMPLX]>(0.18f*avg_div+0.03f*avg_cons)?ch->act[CH_CMPLX]:(0.18f*avg_div+0.03f*avg_cons),0,1); ch->act[CH_FLOW]=clampf(ch->act[CH_FLOW]>(0.12f*avg_vit)?ch->act[CH_FLOW]:(0.12f*avg_vit),0,1); }}
+    if(n>0){ float avg_div=sum_div/n, avg_vit=sum_vit/n, avg_cons=sum_cons/n; ch->presence=clampf(ch->presence>(0.22f*avg_vit+0.04f*avg_cons)?ch->presence:(0.22f*avg_vit+0.04f*avg_cons),0,1); ch->act[CH_CMPLX]=clampf(ch->act[CH_CMPLX]>(0.18f*avg_div+0.03f*avg_cons)?ch->act[CH_CMPLX]:(0.18f*avg_div+0.03f*avg_cons),0,1); ch->act[CH_FLOW]=clampf(ch->act[CH_FLOW]>(0.12f*avg_vit)?ch->act[CH_FLOW]:(0.12f*avg_vit),0,1); ch->phase_lock=clampf(ch->phase_lock>(0.16f*avg_div+0.12f*avg_cons)?ch->phase_lock:(0.16f*avg_div+0.12f*avg_cons),0,1); }}
     pclose(fp);
     return 1;
 }
@@ -1794,6 +1834,9 @@ static int qsqlite_save(const MetaW *mw, const char *path, const PeriodicTable *
     for(int i=0;i<mw->n_prophecy;i++) fprintf(sf,"INSERT INTO prophecies(target,strength,age) VALUES(%d,%.9g,%d);\n",mw->prophecies[i].target,mw->prophecies[i].strength,mw->prophecies[i].age);
     for(int i=0;i<pt->n;i++){ char esc[96]; qsqlite_escape(pt->elements[i].word,esc,sizeof(esc)); fprintf(sf,"INSERT INTO periodic_elements(word,chamber,mass) VALUES('%s',%d,%.9g);\n",esc,pt->elements[i].chamber,pt->elements[i].mass); }
     fprintf(sf,"INSERT OR REPLACE INTO meta(key,value) VALUES('scar','%.9g');\n",ch->scar);
+    fprintf(sf,"INSERT OR REPLACE INTO meta(key,value) VALUES('coherence_state','%.9g');\n",clampf(ch->coherence,0,1));
+    fprintf(sf,"INSERT OR REPLACE INTO meta(key,value) VALUES('phase_lock','%.9g');\n",clampf(ch->phase_lock,0,1));
+    fprintf(sf,"INSERT OR REPLACE INTO meta(key,value) VALUES('threshold_bias','%.9g');\n",clampf(ch->threshold_bias,0,1));
     fprintf(sf,"INSERT INTO chambers(id,presence,debt,trauma,soma0,soma1,soma2,soma3,soma4,soma5) VALUES(1,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g);\n",
         ch->presence,ch->debt,ch->trauma,ch->soma[0],ch->soma[1],ch->soma[2],ch->soma[3],ch->soma[4],ch->soma[5]);
     fprintf(sf,"INSERT INTO episodes(kind,payload) VALUES('snapshot','bi=%d;tri=%d;hebb=%d;prophecy=%d');\n",mw->n_bi,mw->n_tri,mw->n_hebb,mw->n_prophecy);
@@ -1956,6 +1999,12 @@ int main(int argc, char **argv){
                 fread(&ch.debt,4,1,mf);
                 fread(&ch.trauma,4,1,mf);
                 fread(&ch.scar,4,1,mf);
+                {float phase_extra[3]={0};
+                if(fread(phase_extra,sizeof(float),3,mf)==3){
+                    ch.coherence=clampf(phase_extra[0],0,1);
+                    ch.phase_lock=clampf(phase_extra[1],0,1);
+                    ch.threshold_bias=clampf(phase_extra[2],0,1);
+                }}
                 for(int i=0;i<6;i++){
                     ch.soma[i]=clampf(ch.soma[i],0,1);
                     ch.act[i]=clampf(ch.act[i]>0.25f*ch.soma[i]?ch.act[i]:0.25f*ch.soma[i],0,1);
@@ -2014,7 +2063,10 @@ int main(int argc, char **argv){
         fwrite(&ch.presence,4,1,mf);
         fwrite(&ch.debt,4,1,mf);
         fwrite(&ch.trauma,4,1,mf);
-        fwrite(&ch.scar,4,1,mf);}
+        fwrite(&ch.scar,4,1,mf);
+        fwrite(&ch.coherence,4,1,mf);
+        fwrite(&ch.phase_lock,4,1,mf);
+        fwrite(&ch.threshold_bias,4,1,mf);}
         {const char *spore_path="spores/q.spore.bin";
         fclose(mf); qspore_save(mw,spore_path,&pt,&ch); printf("  [memory saved: %d bi, %d tri, %d hebb, %d periodic → q.sqlite + q.memory]\n",mw->n_bi,mw->n_tri,mw->n_hebb,pt.n);}
     }}

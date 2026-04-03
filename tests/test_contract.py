@@ -85,6 +85,21 @@ class UnifiedContractTests(unittest.TestCase):
             self.assertGreater(loaded_ch.presence, 0.0)
             self.assertGreater(loaded_ch.soma[q.CH_LOVE], 0.0)
 
+    def test_binary_memory_roundtrip_preserves_phase_state(self):
+        mw = q.MetaW()
+        ch = q.Chambers()
+        ch.coherence = 0.61
+        ch.phase_lock = 0.57
+        ch.threshold_bias = 0.33
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "q.memory")
+            q.save_memory(mw, path, None, ch)
+            loaded = q.Chambers()
+            self.assertTrue(q.load_memory(q.MetaW(), path, None, loaded))
+            self.assertGreater(loaded.coherence, 0.0)
+            self.assertGreater(loaded.phase_lock, 0.0)
+            self.assertAlmostEqual(loaded.threshold_bias, 0.33, places=3)
+
     def test_legacy_memory_still_loads_without_somatic_tail(self):
         mw = q.MetaW()
         q.ingest_ids(mw, [1, 2, 3, 4], 0.02)
@@ -327,6 +342,32 @@ class UnifiedContractTests(unittest.TestCase):
             self.assertIn("resonance", loaded_pt.elements)
             self.assertGreater(loaded_ch.presence, 0.0)
             self.assertGreater(loaded_ch.scar, 0.0)
+
+    def test_sqlite_phase_state_roundtrip(self):
+        mw = q.MetaW()
+        ch = q.Chambers()
+        ch.coherence = 0.58
+        ch.phase_lock = 0.63
+        ch.threshold_bias = 0.29
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "q.sqlite")
+            q.save_memory_sqlite(mw, path, q.PeriodicTable(), ch)
+            loaded = q.Chambers()
+            self.assertTrue(q.load_memory_sqlite(q.MetaW(), path, q.PeriodicTable(), loaded))
+            self.assertAlmostEqual(loaded.coherence, 0.58, places=3)
+            self.assertAlmostEqual(loaded.phase_lock, 0.63, places=3)
+            self.assertAlmostEqual(loaded.threshold_bias, 0.29, places=3)
+
+    def test_phase_state_hysteresis_persists_after_small_drop(self):
+        ch = q.Chambers()
+        g1 = q.update_phase_state(ch, 0.92, 0.74)
+        lock1 = ch.phase_lock
+        g2 = q.update_phase_state(ch, 0.38, 0.22)
+        self.assertGreater(g1, 0.0)
+        self.assertGreater(lock1, 0.0)
+        self.assertGreater(ch.phase_lock, 0.5 * lock1)
+        self.assertGreaterEqual(g2, 0.0)
+        self.assertLessEqual(g2, 1.0)
 
     def test_sqlite_experience_events_are_persisted(self):
         mw = q.MetaW()

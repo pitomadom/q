@@ -696,7 +696,7 @@ function softmaxArr(x,n){
 // 4. Chambers
 // ═══════════════════════════════════════════════════════════════
 class Chambers {
-  constructor(){this.act=[0,0.2,0,0,0.15,0];this.soma=[0,0,0,0,0,0];this.debt=0;this.trauma=0;this.presence=0;this.scar=0;}
+  constructor(){this.act=[0,0.2,0,0,0.15,0];this.soma=[0,0,0,0,0,0];this.debt=0;this.trauma=0;this.presence=0;this.scar=0;this.coherence=0;this.phaseLock=0;this.thresholdBias=0;}
   feel(text,periodicTable){
     let somaHits=0;
     const somaMix=[0,0,0,0,0,0];
@@ -781,8 +781,29 @@ class Chambers {
     const parts=CH_NAMES.map((n,i)=>this.act[i]>0.05?`${n}:${Math.round(this.act[i]*100)}%`:null).filter(Boolean);
     if(this.presence>0.05)parts.push(`SOMA:${Math.round(this.presence*100)}%`);
     if(this.scar>0.05)parts.push(`SCAR:${Math.round(this.scar*100)}%`);
+    if(this.phaseLock>0.05)parts.push(`PHASE:${Math.round(this.phaseLock*100)}%`);
     return parts.join(' ')||'quiet';
   }
+}
+
+function coherenceEnvPressure(currentChambers,dissonance,prophecyDebt=0,chunkRes=0){
+  return Math.max(0,Math.min(1,0.34*dissonance+0.26*prophecyDebt+0.18*chunkRes+0.10*currentChambers.act[5]+0.08*currentChambers.scar));
+}
+function softPhaseGate(currentChambers,envPressure=0){
+  const threshold=Math.max(0.25,Math.min(0.88,0.42+0.18*currentChambers.thresholdBias+0.06*currentChambers.scar));
+  const signal=Math.max(0,Math.min(1,0.50*currentChambers.coherence+0.34*currentChambers.phaseLock+0.12*envPressure+0.06*currentChambers.presence-0.08*currentChambers.trauma));
+  return Math.max(0,Math.min(1,0.5+1.35*(signal-threshold)));
+}
+function updatePhaseState(currentChambers,localCoherence,envPressure){
+  localCoherence=Math.max(0,Math.min(1,localCoherence));
+  envPressure=Math.max(0,Math.min(1,envPressure));
+  currentChambers.coherence=Math.max(0,Math.min(1,0.84*currentChambers.coherence+0.16*localCoherence));
+  const target=Math.max(0,Math.min(1,0.52*currentChambers.coherence+0.18*currentChambers.presence+0.16*currentChambers.emergence()+0.14*envPressure-0.08*currentChambers.scar));
+  const threshold=Math.max(0.25,Math.min(0.88,0.42+0.18*currentChambers.thresholdBias+0.06*currentChambers.scar));
+  if(target>=threshold)currentChambers.phaseLock=Math.max(0,Math.min(1,0.88*currentChambers.phaseLock+0.12*target+0.05*(target-threshold)));
+  else currentChambers.phaseLock=Math.max(0,Math.min(1,0.975*currentChambers.phaseLock+0.025*target));
+  currentChambers.thresholdBias=Math.max(0,Math.min(1,0.93*currentChambers.thresholdBias+0.07*envPressure));
+  return softPhaseGate(currentChambers,envPressure);
 }
 
 function velocityProfile(currentChambers,dissonance){
@@ -1121,7 +1142,7 @@ function saveBrowserMemory(){
     data.periodic=[...periodic.elements.entries()].map(([w,e])=>({w,ch:e.ch,mass:e.mass}));
   }
   if(chambers){
-    data.chambers={soma:[...chambers.soma],presence:chambers.presence,debt:chambers.debt,trauma:chambers.trauma,scar:chambers.scar};
+    data.chambers={soma:[...chambers.soma],presence:chambers.presence,debt:chambers.debt,trauma:chambers.trauma,scar:chambers.scar,coherence:chambers.coherence,phaseLock:chambers.phaseLock,thresholdBias:chambers.thresholdBias};
   }
   if(parliament){
     data.parliament={lastK:parliament.lastK,lastEntropy:parliament.lastEntropy,lastDiversity:parliament.lastDiversity,lastWinners:[...parliament.lastWinners],lastBirths:parliament.lastBirths||0,lastDeaths:parliament.lastDeaths||0,lastConsolidations:parliament.lastConsolidations||0};
@@ -1157,6 +1178,9 @@ function loadBrowserMemory(){
       chambers.debt=Math.max(0,Math.min(1,Number(mem.chambers.debt)||0));
       chambers.trauma=Math.max(0,Math.min(1,Number(mem.chambers.trauma)||0));
       chambers.scar=Math.max(0,Math.min(1,Number(mem.chambers.scar)||0));
+      chambers.coherence=Math.max(0,Math.min(1,Number(mem.chambers.coherence)||0));
+      chambers.phaseLock=Math.max(0,Math.min(1,Number(mem.chambers.phaseLock)||0));
+      chambers.thresholdBias=Math.max(0,Math.min(1,Number(mem.chambers.thresholdBias)||0));
     }
     if(mem.parliament&&parliament){
       parliament.lastK=Number(mem.parliament.lastK)||0;
@@ -1506,9 +1530,10 @@ function generateChain(inputText){
   chambers.debt=Math.max(0,Math.min(1,(0.88*chambers.debt+0.12*mw.prophecyPressure())*velocity.debtDecay));
   chambers.trauma=Math.max(0,Math.min(1,chambers.trauma*velocity.traumaDecay));
   chambers.scar=Math.max(0,Math.min(1,chambers.scar*velocity.scarDecay));
+  let phaseGate=softPhaseGate(chambers,coherenceEnvPressure(chambers,cd,mw.prophecyPressure(),0));
 
   const modeStr=tf&&tf.loaded?'TRAINED':'METAWEIGHTS ONLY';
-  log(`diss=${cd.toFixed(3)} debt=${chambers.debt.toFixed(3)} scar=${chambers.scar.toFixed(3)} emrg=${chambers.emergence().toFixed(3)} vel=${velocity.name} [${modeStr}]`);
+  log(`diss=${cd.toFixed(3)} debt=${chambers.debt.toFixed(3)} scar=${chambers.scar.toFixed(3)} gate=${phaseGate.toFixed(3)} emrg=${chambers.emergence().toFixed(3)} vel=${velocity.name} [${modeStr}]`);
   log(`chambers: ${chambers.summary()}`,'sys');
   if(interference&&interference.docs.length)log(`interference: ${interference.docs.length} docs loaded`,'sys');
   updateStats();
@@ -1596,7 +1621,7 @@ function generateChain(inputText){
       let whProb=0.02;
       if(cd>0.3)whProb+=((cd-0.3)/0.7)*0.15;
       whProb=Math.max(0,Math.min(0.3,whProb+velocity.wormholeBonus));
-      const boundaryOk=bestOut.length>10&&bestSc>0.35;
+      const boundaryOk=bestOut.length>10&&bestSc>(0.22+0.18*phaseGate);
       wormhole=boundaryOk&&(Math.random()<whProb);
       if(wormhole&&interference&&interference.docs.length){
         const farthest=[...interference.docs].sort((a,b)=>b.heavy.length-a.heavy.length)[0];
@@ -1619,6 +1644,9 @@ function generateChain(inputText){
       addStep(si+1,dir,text+(usedInterf?' {interf}':'')+(wormhole?' {wormhole}':''));
       chambers.feel(text,periodic);
       ingestIds(bpe.encode(text),0.005);
+      const localPhase=Math.max(0,Math.min(1,0.50+0.25*bestSc+0.04*surfaceCoherenceScore(bestOut)));
+      const chunkRes=activeChunk?activeChunk.heavy.length/16:0;
+      phaseGate=updatePhaseState(chambers,localPhase,coherenceEnvPressure(chambers,cd,mw.prophecyPressure(),chunkRes));
     }
     chambers.crossfire(3);
     chambers.debt=0.9*chambers.debt+0.05;
@@ -1631,7 +1659,8 @@ function generateChain(inputText){
     let minSc=spaScores[0],weakIdx=0;
     for(let i=1;i<CHAIN;i++)if(spaScores[i]<minSc){minSc=spaScores[i];weakIdx=i;}
     let avgSc=0;for(let i=0;i<CHAIN;i++)avgSc+=spaScores[i];avgSc/=CHAIN;
-    if(minSc<avgSc*0.6){ // slightly more aggressive threshold
+    const reseedFloor=avgSc*(0.52+0.18*(1-phaseGate));
+    if(minSc<reseedFloor){
       log(`[SPA-${spaPass+1}] reseeding step ${weakIdx+1} (score=${minSc.toFixed(2)}, avg=${avgSc.toFixed(2)})`);
       // use neighbor sentences as context for better continuity
       const seedSrc=weakIdx>0?weakIdx-1:(weakIdx<CHAIN-1?weakIdx+1:0);
@@ -1648,6 +1677,7 @@ function generateChain(inputText){
         addStep(weakIdx+1,dir,rText+' {reseeded}');
         chambers.feel(rText,periodic);
         ingestIds(rOut,0.003);
+        phaseGate=updatePhaseState(chambers,Math.max(0,Math.min(1,0.48+0.22*newSc)),coherenceEnvPressure(chambers,cd,mw.prophecyPressure(),0));
       }
     }else break; // no weak sentences, stop iterating
   }

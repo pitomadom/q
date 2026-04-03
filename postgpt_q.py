@@ -628,6 +628,15 @@ def load_memory_sqlite(mw, path, periodic=None, chambers=None):
                 scar_row = cur.execute("SELECT value FROM meta WHERE key='scar'").fetchone()
                 if scar_row is not None:
                     chambers.scar = clampf(max(getattr(chambers, "scar", 0.0), float(scar_row[0])), 0.0, 1.0)
+                coh_row = cur.execute("SELECT value FROM meta WHERE key='coherence_state'").fetchone()
+                if coh_row is not None:
+                    chambers.coherence = clampf(max(getattr(chambers, "coherence", 0.0), float(coh_row[0])), 0.0, 1.0)
+                lock_row = cur.execute("SELECT value FROM meta WHERE key='phase_lock'").fetchone()
+                if lock_row is not None:
+                    chambers.phase_lock = clampf(max(getattr(chambers, "phase_lock", 0.0), float(lock_row[0])), 0.0, 1.0)
+                bias_row = cur.execute("SELECT value FROM meta WHERE key='threshold_bias'").fetchone()
+                if bias_row is not None:
+                    chambers.threshold_bias = clampf(float(bias_row[0]), 0.0, 1.0)
             scar_rows = list(cur.execute("SELECT scar FROM scar_events ORDER BY id DESC LIMIT 8"))
             if scar_rows:
                 scar_res = sum(row[0] for row in scar_rows) / len(scar_rows)
@@ -663,6 +672,8 @@ def load_memory_sqlite(mw, path, periodic=None, chambers=None):
                 chambers.presence = clampf(max(chambers.presence, 0.22 * avg_vit + 0.04 * avg_cons), 0.0, 1.0)
                 chambers.act[CH_CMPLX] = clampf(max(chambers.act[CH_CMPLX], 0.18 * avg_div + 0.03 * avg_cons), 0.0, 1.0)
                 chambers.act[CH_FLOW] = clampf(max(chambers.act[CH_FLOW], 0.12 * avg_vit), 0.0, 1.0)
+                chambers.coherence = clampf(max(chambers.coherence, 0.20 * avg_div + 0.16 * avg_vit), 0.0, 1.0)
+                chambers.phase_lock = clampf(max(chambers.phase_lock, 0.16 * avg_div + 0.12 * avg_cons), 0.0, 1.0)
         conn.close()
         return True
     except Exception:
@@ -692,6 +703,9 @@ def save_memory_sqlite(mw, path, periodic=None, chambers=None, events=None):
             (clampf(chambers.presence, 0.0, 1.0), clampf(chambers.debt, 0.0, 1.0), clampf(chambers.trauma, 0.0, 1.0), *[clampf(v, 0.0, 1.0) for v in chambers.soma])
         )
         cur.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('scar',?)", (str(clampf(getattr(chambers, "scar", 0.0), 0.0, 1.0)),))
+        cur.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('coherence_state',?)", (str(clampf(getattr(chambers, "coherence", 0.0), 0.0, 1.0)),))
+        cur.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('phase_lock',?)", (str(clampf(getattr(chambers, "phase_lock", 0.0), 0.0, 1.0)),))
+        cur.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('threshold_bias',?)", (str(clampf(getattr(chambers, "threshold_bias", 0.0), 0.0, 1.0)),))
     cur.execute("INSERT INTO episodes(kind,payload) VALUES('snapshot', ?)",
                 (f"bi={mw.n_bi};tri={mw.n_tri};hebb={mw.n_hebb};prophecy={len(mw.prophecies)}",))
     episode_id = cur.lastrowid
@@ -888,6 +902,12 @@ def load_memory(mw, path, periodic=None, chambers=None):
                         scar_data = mf.read(4)
                         if len(scar_data) == 4:
                             chambers.scar = clampf(max(getattr(chambers, "scar", 0.0), struct.unpack("<f", scar_data)[0]), 0.0, 1.0)
+                        extra = mf.read(12)
+                        if len(extra) == 12:
+                            coherence, phase_lock, threshold_bias = struct.unpack("<3f", extra)
+                            chambers.coherence = clampf(max(getattr(chambers, "coherence", 0.0), coherence), 0.0, 1.0)
+                            chambers.phase_lock = clampf(max(getattr(chambers, "phase_lock", 0.0), phase_lock), 0.0, 1.0)
+                            chambers.threshold_bias = clampf(threshold_bias, 0.0, 1.0)
             except Exception:
                 pass
         return True
@@ -920,6 +940,7 @@ def save_memory(mw, path, periodic=None, chambers=None):
             mf.write(struct.pack("<6f", *[clampf(v, 0.0, 1.0) for v in chambers.soma]))
             mf.write(struct.pack("<3f", clampf(chambers.presence, 0.0, 1.0), clampf(chambers.debt, 0.0, 1.0), clampf(chambers.trauma, 0.0, 1.0)))
             mf.write(struct.pack("<f", clampf(getattr(chambers, "scar", 0.0), 0.0, 1.0)))
+            mf.write(struct.pack("<3f", clampf(getattr(chambers, "coherence", 0.0), 0.0, 1.0), clampf(getattr(chambers, "phase_lock", 0.0), 0.0, 1.0), clampf(getattr(chambers, "threshold_bias", 0.0), 0.0, 1.0)))
 def save_spore(mw, path, periodic=None, chambers=None):
     d = os.path.dirname(path)
     if d:
@@ -995,6 +1016,9 @@ class Chambers:
         self.trauma = 0.0
         self.presence = 0.0
         self.scar = 0.0
+        self.coherence = 0.0
+        self.phase_lock = 0.0
+        self.threshold_bias = 0.0
 
     def feel(self, text, periodic=None):
         soma_hits = 0
@@ -1084,7 +1108,28 @@ class Chambers:
             parts.append("SOMA:%.0f%%" % (self.presence * 100.0))
         if self.scar > 0.05:
             parts.append("SCAR:%.0f%%" % (self.scar * 100.0))
+        if self.phase_lock > 0.05:
+            parts.append("PHASE:%.0f%%" % (self.phase_lock * 100.0))
         return " ".join(parts) if parts else "quiet"
+def coherence_env_pressure(ch, dissonance, prophecy_debt=0.0, chunk_res=0.0):
+    return clampf(0.34 * dissonance + 0.26 * prophecy_debt + 0.18 * chunk_res + 0.10 * ch.act[CH_CMPLX] + 0.08 * ch.scar, 0.0, 1.0)
+def soft_phase_gate(ch, env_pressure=0.0):
+    threshold = clampf(0.42 + 0.18 * ch.threshold_bias + 0.06 * ch.scar, 0.25, 0.88)
+    signal = clampf(0.50 * ch.coherence + 0.34 * ch.phase_lock + 0.12 * env_pressure + 0.06 * ch.presence - 0.08 * ch.trauma, 0.0, 1.0)
+    gate = clampf(0.5 + 1.35 * (signal - threshold), 0.0, 1.0)
+    return gate
+def update_phase_state(ch, local_coherence, env_pressure):
+    local_coherence = clampf(local_coherence, 0.0, 1.0)
+    env_pressure = clampf(env_pressure, 0.0, 1.0)
+    ch.coherence = clampf(0.84 * ch.coherence + 0.16 * local_coherence, 0.0, 1.0)
+    target = clampf(0.52 * ch.coherence + 0.18 * ch.presence + 0.16 * ch.emergence() + 0.14 * env_pressure - 0.08 * ch.scar, 0.0, 1.0)
+    threshold = clampf(0.42 + 0.18 * ch.threshold_bias + 0.06 * ch.scar, 0.25, 0.88)
+    if target >= threshold:
+        ch.phase_lock = clampf(0.88 * ch.phase_lock + 0.12 * target + 0.05 * (target - threshold), 0.0, 1.0)
+    else:
+        ch.phase_lock = clampf(0.975 * ch.phase_lock + 0.025 * target, 0.0, 1.0)
+    ch.threshold_bias = clampf(0.93 * ch.threshold_bias + 0.07 * env_pressure, 0.0, 1.0)
+    return soft_phase_gate(ch, env_pressure)
 def ch_init(c):
     c.act = [0.0] * 6
     c.soma = [0.0] * 6
@@ -1094,6 +1139,9 @@ def ch_init(c):
     c.trauma = 0.0
     c.presence = 0.0
     c.scar = 0.0
+    c.coherence = 0.0
+    c.phase_lock = 0.0
+    c.threshold_bias = 0.0
 def ch_xfire(c, it):
     for _ in range(it):
         old = list(c.act)
@@ -2275,9 +2323,10 @@ def gen_chain(t, bpe, mw, ch, cids, clen, has_weights, parl, periodic=None, inte
     ch.debt = clampf((0.88 * ch.debt + 0.12 * prophecy_pressure(mw)) * vel["debt_decay"], 0.0, 1.0)
     ch.trauma = clampf(ch.trauma * vel["trauma_decay"], 0.0, 1.0)
     ch.scar = clampf(ch.scar * vel["scar_decay"], 0.0, 1.0)
+    phase_gate = soft_phase_gate(ch, coherence_env_pressure(ch, cd, prophecy_pressure(mw), 0.0))
 
     mode_str = "[TRAINED]" if has_weights else "[METAWEIGHTS ONLY]"
-    print("\n  diss=%.3f debt=%.3f scar=%.3f emrg=%.3f vel=%s %s" % (cd, ch.debt, ch.scar, ch.emergence(), vel["name"], mode_str))
+    print("\n  diss=%.3f debt=%.3f scar=%.3f gate=%.3f emrg=%.3f vel=%s %s" % (cd, ch.debt, ch.scar, phase_gate, ch.emergence(), vel["name"], mode_str))
     print("  chambers: %s" % ch.summary())
     if parl is not None:
         av = sum(e.vitality for e in parl.ex) / (parl.n if parl.n > 0 else 1)
@@ -2400,7 +2449,7 @@ def gen_chain(t, bpe, mw, ch, cids, clen, has_weights, parl, periodic=None, inte
             if cd > 0.3:
                 wh_prob += ((cd - 0.3) / 0.7) * 0.15
             wh_prob = clampf(wh_prob + vel["wormhole_bonus"], 0.0, 0.3)
-            boundary_ok = best_ol > 10 and best_sc > 0.35
+            boundary_ok = best_ol > 10 and best_sc > (0.22 + 0.18 * phase_gate)
             wormhole = boundary_ok and (random.random() < wh_prob)
             if wormhole and interference is not None and interference.docs:
                 longest = max(interference.docs, key=lambda d: len(d["heavy"]))
@@ -2444,6 +2493,9 @@ def gen_chain(t, bpe, mw, ch, cids, clen, has_weights, parl, periodic=None, inte
             ch.feel(out_text, periodic)
             if out_text:
                 ingest_ids(mw, bpe_encode(bpe, out_text.encode("utf-8", errors="replace"), len(out_text.encode("utf-8", errors="replace")), 256), 0.005)
+            local_phase = clampf(0.50 + 0.25 * best_sc + 0.04 * surface_coherence_score(bpe, best_out), 0.0, 1.0)
+            chunk_res = (float(len(active_chunk.get("heavy", []))) / 16.0) if active_chunk is not None else 0.0
+            phase_gate = update_phase_state(ch, local_phase, coherence_env_pressure(ch, cd, prophecy_pressure(mw), chunk_res))
 
         chain_ids[si] = list(best_out)
         chain_lens[si] = best_ol
@@ -2469,8 +2521,9 @@ def gen_chain(t, bpe, mw, ch, cids, clen, has_weights, parl, periodic=None, inte
                 min_sc = spa_scores[i]
                 weak_idx = i
         avg_sc = sum(spa_scores) / CHAIN_STEPS
+        reseed_floor = avg_sc * (0.52 + 0.18 * (1.0 - phase_gate))
 
-        if min_sc < avg_sc * 0.6:  # slightly more aggressive threshold
+        if min_sc < reseed_floor:
             print("  [SPA-%d] reseeding step %d (score=%.2f, avg=%.2f)" % (spa_pass + 1, weak_idx + 1, min_sc, avg_sc))
             # use neighbor sentences as context for better continuity
             seed_src = weak_idx - 1 if weak_idx > 0 else (weak_idx + 1 if weak_idx < CHAIN_STEPS - 1 else 0)
@@ -2502,6 +2555,7 @@ def gen_chain(t, bpe, mw, ch, cids, clen, has_weights, parl, periodic=None, inte
                 out_text = "".join(text_parts)
                 ch.feel(out_text, periodic)
                 ingest_ids(mw, result, 0.003)
+                phase_gate = update_phase_state(ch, clampf(0.48 + 0.22 * new_sc, 0.0, 1.0), coherence_env_pressure(ch, cd, prophecy_pressure(mw), 0.0))
         else:
             break  # no weak sentences, stop iterating
 

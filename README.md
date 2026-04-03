@@ -69,6 +69,16 @@ Prophecy is also persistent during inference. Q keeps a small active field of ex
 
 This means unresolved expectations continue to bend continuation until they are either fulfilled or dissipate.
 
+### Coherence Phase Memory
+
+Q now carries a small persistent coherence state rather than judging coherence only locally. Three numbers circulate across runs:
+
+- **coherence** — smoothed local continuity signal
+- **phase lock** — hysteretic retention of a coherent regime once entered
+- **threshold bias** — environment-sensitive modulation of how hard it is to enter or keep that regime
+
+These values do not replace generation. They softly gate existing behavior: wormhole permission, SPA reseed aggressiveness, and how long Q holds onto a coherent mode before collapsing back.
+
 ### DOE Parliament (δ — the physics)
 
 Q carries a compact **DoE-lite parliament** rather than the full standalone `DOE` organism. It is a tighter in-engine version: 4 rank-4 LoRA experts that vote, learn, split, and die during inference.
@@ -201,7 +211,7 @@ python3 postgpt_q.py q.merges q.txt
 
 # HTML/JS (browser — standalone, no server needed)
 # Open q.html in browser. Click DEMO or drag-drop q.txt. Drag-drop .bin weights for trained mode.
-# Browser memory persists through localStorage, including periodic semantics and somatic state.
+# Browser memory persists through localStorage, including periodic semantics, somatic state, and phase memory.
 # Native engines also maintain q.sqlite as the primary memory organ and q.memory as a binary shard snapshot.
 ```
 
@@ -211,7 +221,7 @@ Requires: `q.merges` (BPE merge table, binary) and `q.txt` (corpus).
 
 ```bash
 gcc tests/test_all.c -O2 -lm -o test_all && ./test_all    # 40 C tests
-python3 -m unittest tests.test_contract                     # 20 Python contract tests
+python3 -m unittest tests.test_contract                     # 28 Python contract tests
 ```
 
 ## Example Output
