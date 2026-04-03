@@ -427,7 +427,7 @@ static VelocityProfile velocity_profile(const Chambers *c, float dissonance){
     return vp;
 }
 
-typedef struct{char name[64]; int heavy[MAX_HEAVY]; int n_heavy;}InterferenceDoc;
+typedef struct{char name[64]; int heavy[MAX_HEAVY]; int n_heavy; char keywords[16][32]; int n_keywords;}InterferenceDoc;
 typedef struct{InterferenceDoc docs[MAX_INTERF_DOCS]; int n_docs;}Interference;
 static void interf_load(Interference *itf, const char *docs_dir, const BPE *bpe){
     static const char *doc_names[]={
@@ -448,11 +448,37 @@ static void interf_load(Interference *itf, const char *docs_dir, const BPE *bpe)
             int tok=tmp.bigrams[i].a,dup=0; char buf[64]; bpe_decode_token(bpe,tok,buf,sizeof(buf));
             for(int j=0;j<doc->n_heavy;j++) if(doc->heavy[j]==tok){dup=1;break;}
             int alpha=0; for(int j=0;buf[j];j++) if(isalpha((unsigned char)buf[j])) alpha++;
-            if(!dup&&alpha>2) doc->heavy[doc->n_heavy++]=tok;
+            if(!dup&&alpha>2){
+                doc->heavy[doc->n_heavy++]=tok;
+                if(doc->n_keywords<16){
+                    for(int j=0;buf[j];j++) buf[j]=(char)tolower((unsigned char)buf[j]);
+                    strncpy(doc->keywords[doc->n_keywords],buf,31);
+                    doc->keywords[doc->n_keywords][31]=0;
+                    doc->n_keywords++;
+                }
+            }
         }
         if(doc->n_heavy>0) itf->n_docs++;
         free(ids); free(raw);
     }
+}
+static const InterferenceDoc *interf_choose_doc(const Interference *itf, const char *text, const Chambers *c, const PeriodicTable *pt){
+    if(!itf||itf->n_docs<=0) return NULL;
+    int dom=c?ch_dominant(c):CH_FLOW;
+    const InterferenceDoc *best=&itf->docs[rand()%itf->n_docs]; float best_score=-1e30f;
+    for(int di=0;di<itf->n_docs;di++){
+        const InterferenceDoc *doc=&itf->docs[di];
+        float score=0.01f*(float)doc->n_heavy;
+        for(int ki=0;ki<doc->n_keywords;ki++){
+            const char *word=doc->keywords[ki];
+            if(text&&strstr(text,word)) score+=1.2f;
+            for(size_t j=0;j<sizeof(ANCHORS)/sizeof(ANCHORS[0]);j++) if(strcmp(word,ANCHORS[j].word)==0&&ANCHORS[j].chamber==dom) score+=0.6f;
+            if(pt){ int idx=periodic_find(pt,word); if(idx>=0&&pt->elements[idx].chamber==dom) score+=0.35f*pt->elements[idx].mass; }
+        }
+        score+=0.05f*((float)rand()/RAND_MAX);
+        if(score>best_score){best_score=score;best=doc;}
+    }
+    return best;
 }
 static int interf_seed(const Interference *itf, const Chambers *c, const BPE *bpe, const PeriodicTable *pt){
     if(!itf||itf->n_docs<=0) return -1;
@@ -467,6 +493,28 @@ static int interf_seed(const Interference *itf, const Chambers *c, const BPE *bp
         if(sc>best_score){best_score=sc;best=doc->heavy[i];}
     }
     return best;
+}
+static int interf_seed_from_doc(const InterferenceDoc *doc, const Chambers *c, const BPE *bpe, const PeriodicTable *pt){
+    if(!doc||doc->n_heavy<=0) return -1;
+    int dom=ch_dominant(c),best=doc->heavy[rand()%doc->n_heavy]; float best_score=-1e30f;
+    for(int i=0;i<doc->n_heavy&&i<MAX_HEAVY;i++){
+        char buf[64]; float sc=((float)rand()/RAND_MAX)*0.05f; bpe_decode_token(bpe,doc->heavy[i],buf,sizeof(buf));
+        for(int j=0;buf[j];j++) buf[j]=(char)tolower((unsigned char)buf[j]);
+        for(size_t j=0;j<sizeof(ANCHORS)/sizeof(ANCHORS[0]);j++) if(strcmp(buf,ANCHORS[j].word)==0&&ANCHORS[j].chamber==dom) sc+=1.0f;
+        if(pt){ int idx=periodic_find(pt,buf); if(idx>=0&&pt->elements[idx].chamber==dom) sc+=0.5f*pt->elements[idx].mass; }
+        if(sc>best_score){best_score=sc;best=doc->heavy[i];}
+    }
+    return best;
+}
+static void interf_signal(const InterferenceDoc *doc, float *out, int V){
+    for(int i=0;i<V;i++) out[i]=0;
+    if(!doc) return;
+    float mx=0;
+    for(int rank=0;rank<doc->n_heavy&&rank<16;rank++){
+        int tid=doc->heavy[rank];
+        if(tid>=0&&tid<V){out[tid]+=1.0f/(1.0f+(float)rank); if(out[tid]>mx) mx=out[tid];}
+    }
+    if(mx>1e-8f) for(int i=0;i<V;i++) out[i]/=mx;
 }
 
 /* ── DOE Parliament — Democracy of Experts ── */
@@ -776,7 +824,7 @@ static int starts_with_space(const BPE *bpe, int id){
 static int gen_sent(TF *t, const BPE *bpe, MetaW *mw,
                     const int *prompt, int plen, float temp,
                     int *out, int maxo, Parliament *parl, float *global_destiny,
-                    Chambers *ch_ptr, const VelocityProfile *vel){
+                    Chambers *ch_ptr, const VelocityProfile *vel, const float *doc_signal){
     tf_reset(t); int V=t->V,D=t->D;
     float *destiny=calloc(D,sizeof(float));
     /* inherit global destiny direction (thematic coherence across chain) */
@@ -837,6 +885,7 @@ static int gen_sent(TF *t, const BPE *bpe, MetaW *mw,
         float c_heb=(has_tf?0.6f:1.0f)*am, c_pro=(has_tf?0.4f:0.7f)*bm;
         float c_ds=(has_tf?0.3f:0.15f)*gm, c_bg=has_tf?5.0f:15.0f, c_tg=has_tf?3.0f:10.0f;
         if(vel){c_heb*=vel->heb_mul;c_pro*=vel->pro_mul;c_ds*=vel->ds_mul;c_bg*=vel->bg_mul;c_tg*=vel->tg_mul;}
+        float c_doc=has_tf?0.18f:0.32f;
         for(int i=0;i<V;i++){
             float bg=meta_bi(mw,ctx[cl-1],i);
             float tg=cl>=2?meta_tri(mw,ctx[cl-2],ctx[cl-1],i):1e-10f;
@@ -844,6 +893,7 @@ static int gen_sent(TF *t, const BPE *bpe, MetaW *mw,
             if(dn>1e-8f){float en=0;for(int d=0;d<D;d++) en+=t->tok[i*D+d]*t->tok[i*D+d];
                 en=sqrtf(en+1e-10f);if(en>1e-8f){float dot=0;for(int d=0;d<D;d++) dot+=destiny[d]*t->tok[i*D+d];ds=dot/(dn*en);}}
             raw[i]+=c_heb*heb[i]+c_pro*pro[i]+c_ds*ds+c_bg*bg+c_tg*tg;
+            if(doc_signal) raw[i]+=c_doc*doc_signal[i];
             if(mw->unigram[i]<1e-6f) raw[i]-=2.0f;
             else if(mw->unigram[i]>0.01f) raw[i]-=0.3f*(mw->unigram[i]-0.01f)*100.0f;
         }
@@ -994,9 +1044,19 @@ static void gen_chain(TF *t, const BPE *bpe, MetaW *mw, Chambers *ch,
     int chain_ids[CHAIN_STEPS][256]; int chain_lens[CHAIN_STEPS];
     for(int si=0;si<CHAIN_STEPS;si++){
         int dir=si<nb?-1:(si==nb?0:1);
+        const InterferenceDoc *active_doc=(itf&&itf->n_docs>0)?interf_choose_doc(itf,input_text,ch,pt):NULL;
+        float *doc_signal=NULL;
+        if(active_doc){
+            doc_signal=calloc(t->V,sizeof(float));
+            interf_signal(active_doc,doc_signal,t->V);
+            if(active_doc->n_heavy>0){
+                int seed_tok=active_doc->heavy[0];
+                if(seed_tok>=0&&seed_tok<t->V) for(int d=0;d<t->D;d++) gdest[d]=0.97f*gdest[d]+0.03f*t->tok[seed_tok*t->D+d];
+            }
+        }
         int prompt[5]={0},plen=0,used_interf=0;
         if(itf&&itf->n_docs>0&&((float)rand()/RAND_MAX)<clampf(0.3f+vel.interf_bonus,0.05f,0.5f)){
-            int seed=interf_seed(itf,ch,bpe,pt);
+            int seed=active_doc?interf_seed_from_doc(active_doc,ch,bpe,pt):interf_seed(itf,ch,bpe,pt);
             if(seed>=0){prompt[0]=seed;plen=1;used_interf=1;}
         }
         if(plen==0&&input_text&&input_text[0]){
@@ -1042,7 +1102,7 @@ static void gen_chain(TF *t, const BPE *bpe, MetaW *mw, Chambers *ch,
         float gdest_save[256]; if(t->D<=256) memcpy(gdest_save,gdest,t->D*sizeof(float));
         for(int cand=0;cand<3;cand++){
             if(cand>0&&t->D<=256) memcpy(gdest,gdest_save,t->D*sizeof(float)); /* restore destiny */
-            int out[256],ol=gen_sent(t,bpe,mw,prompt,plen,temp,out,256,parl,gdest,ch,&vel);
+            int out[256],ol=gen_sent(t,bpe,mw,prompt,plen,temp,out,256,parl,gdest,ch,&vel,doc_signal);
             float sc=coherence_score(mw,out,ol,t->V);
             if(sc>best_sc){best_sc=sc;best_ol=ol;memcpy(best_out,out,ol*sizeof(int));}
             if(best_sc>1.0f&&best_ol>12) break; /* early exit if first candidate is strong */
@@ -1059,7 +1119,7 @@ static void gen_chain(TF *t, const BPE *bpe, MetaW *mw, Chambers *ch,
                 if(doc->n_heavy>0){
                     int wh_prompt[1]={doc->heavy[rand()%doc->n_heavy]};
                     dir=dir!=0?-dir:1;
-                    best_ol=gen_sent(t,bpe,mw,wh_prompt,1,has_weights?0.55f:0.7f,best_out,256,parl,gdest,ch,&vel);
+                    best_ol=gen_sent(t,bpe,mw,wh_prompt,1,has_weights?0.55f:0.7f,best_out,256,parl,gdest,ch,&vel,doc_signal);
                     best_sc=coherence_score(mw,best_out,best_ol,t->V);
                 }
             }
@@ -1081,7 +1141,7 @@ static void gen_chain(TF *t, const BPE *bpe, MetaW *mw, Chambers *ch,
         }
         /* save for SPA */
         chain_lens[si]=best_ol; memcpy(chain_ids[si],best_out,best_ol*sizeof(int));
-        ch_xfire(ch,3); ch->debt=0.9f*ch->debt+0.05f;
+        ch_xfire(ch,3); ch->debt=0.9f*ch->debt+0.05f; if(doc_signal) free(doc_signal);
     }
     /* SPA: iterative cross-attention — reseed weak sentences, verify improvement */
     float spa_embs[CHAIN_STEPS][SPA_DIM]; float spa_scores[CHAIN_STEPS];
@@ -1098,7 +1158,7 @@ static void gen_chain(TF *t, const BPE *bpe, MetaW *mw, Chambers *ch,
             int seed_src=weak_idx>0?weak_idx-1:(weak_idx<CHAIN_STEPS-1?weak_idx+1:0);
             int nprom=chain_lens[seed_src]>3?3:chain_lens[seed_src];
             int prompt[5]; for(int i=0;i<nprom;i++) prompt[i]=chain_ids[seed_src][chain_lens[seed_src]-nprom+i];
-            int out[256],ol=gen_sent(t,bpe,mw,prompt,nprom,has_weights?0.55f:0.7f,out,256,parl,gdest,ch,&vel);
+            int out[256],ol=gen_sent(t,bpe,mw,prompt,nprom,has_weights?0.55f:0.7f,out,256,parl,gdest,ch,&vel,NULL);
             float new_sc=coherence_score(mw,out,ol,t->V);
             float old_sc=coherence_score(mw,chain_ids[weak_idx],chain_lens[weak_idx],t->V);
             if(new_sc>old_sc*0.7f||ol>chain_lens[weak_idx]){ /* accept if reasonable */

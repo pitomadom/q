@@ -104,6 +104,18 @@ class UnifiedContractTests(unittest.TestCase):
         self.assertLess(breathe["debt_decay"], 1.0)
         self.assertLess(breathe["trauma_decay"], 1.0)
 
+    def test_interference_doc_selection_prefers_prompt_resonance(self):
+        itf = q.Interference()
+        itf.docs = [
+            {"name": "a.txt", "heavy": [1, 2], "keywords": ["resonance", "choir", "counterpoint"]},
+            {"name": "b.txt", "heavy": [3, 4], "keywords": ["fungus", "mycelium", "forest"]},
+        ]
+        ch = q.Chambers()
+        ch.feel("resonance in the choir", None)
+        doc = itf.choose_doc("resonance in the choir", ch, q.PeriodicTable())
+        self.assertIsNotNone(doc)
+        self.assertEqual(doc["name"], "a.txt")
+
 
 if __name__ == "__main__":
     unittest.main()

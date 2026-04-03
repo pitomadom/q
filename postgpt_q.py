@@ -737,18 +737,46 @@ class Interference:
                 counts[a] = counts.get(a, 0) + 1
                 counts[b] = counts.get(b, 0) + 1
             ranked = sorted(counts.items(), key=lambda x: (-x[1], x[0]))
+            keywords = []
             for tok, _score in ranked:
                 dec = bpe_decode_token(bpe, tok).strip()
                 if len(dec) > 2 and any(ch.isalpha() for ch in dec):
                     heavy.append(tok)
+                    keywords.append(dec.lower())
                 if len(heavy) >= 32:
                     break
-            self.docs.append({"name": fn, "heavy": heavy or ids[:32]})
+            self.docs.append({"name": fn, "heavy": heavy or ids[:32], "keywords": keywords[:16]})
 
-    def inject_seed(self, chambers=None, bpe=None, periodic=None):
+    def choose_doc(self, text=None, chambers=None, periodic=None):
         if not self.docs:
             return None
-        doc = random.choice(self.docs)
+        if chambers is None and not text:
+            return random.choice(self.docs)
+        words = set(extract_words(text or ""))
+        dom = chambers.dominant() if chambers is not None else CH_FLOW
+        best_doc = None
+        best_score = -1e30
+        for doc in self.docs:
+            score = 0.01 * len(doc["heavy"])
+            for word in doc.get("keywords", []):
+                if word in words:
+                    score += 1.2
+                if word in ANCHORS and ANCHORS[word] == dom:
+                    score += 0.6
+                if periodic is not None:
+                    el = periodic.classify(word)
+                    if el is not None and el["ch"] == dom:
+                        score += 0.35 * el["mass"]
+            score += random.random() * 0.05
+            if score > best_score:
+                best_score = score
+                best_doc = doc
+        return best_doc
+
+    def inject_seed(self, chambers=None, bpe=None, periodic=None, doc=None):
+        if not self.docs and doc is None:
+            return None
+        doc = doc or random.choice(self.docs)
         if not doc["heavy"]:
             return None
         if chambers is None or bpe is None:
@@ -776,6 +804,18 @@ class Interference:
             if cum >= r:
                 return tid
         return top[0][1]
+def interference_signal(doc, V):
+    out = [0.0] * V
+    if doc is None:
+        return out
+    for rank, tid in enumerate(doc.get("heavy", [])[:16]):
+        if 0 <= tid < V:
+            out[tid] += 1.0 / (1.0 + rank)
+    mx = max(out) if out else 0.0
+    if mx > 1e-8:
+        for i in range(V):
+            out[i] /= mx
+    return out
 # ── DOE Parliament ──
 class Expert:
     def __init__(self):
@@ -1204,7 +1244,7 @@ def starts_with_space(bpe, tid):
         return False
     return b[0] == ord(' ')
 # ── generate sentence ──
-def gen_sent(t, bpe, mw, prompt, plen, temp, maxo, parl, global_destiny, ch_ptr, velocity=None):
+def gen_sent(t, bpe, mw, prompt, plen, temp, maxo, parl, global_destiny, ch_ptr, velocity=None, doc_signal=None):
     tf_reset(t)
     V = t.V; D = t.D
     destiny = [0.0] * D
@@ -1297,6 +1337,7 @@ def gen_sent(t, bpe, mw, prompt, plen, temp, maxo, parl, global_destiny, ch_ptr,
             c_ds *= velocity["ds_mul"]
             c_bg *= velocity["bg_mul"]
             c_tg *= velocity["tg_mul"]
+        c_doc = 0.18 if has_tf else 0.32
 
         for i in range(V):
             bg = meta_bi(mw, ctx[cl - 1], i)
@@ -1308,6 +1349,8 @@ def gen_sent(t, bpe, mw, prompt, plen, temp, maxo, parl, global_destiny, ch_ptr,
                     dot = sum(destiny[d] * t.tok[i * D + d] for d in range(D))
                     ds = dot / (dn * en)
             raw[i] += c_heb * heb[i] + c_pro * pro[i] + c_ds * ds + c_bg * bg + c_tg * tg_val
+            if doc_signal is not None:
+                raw[i] += c_doc * doc_signal[i]
             if mw.unigram[i] < 1e-6:
                 raw[i] -= 2.0
             elif mw.unigram[i] > 0.01:
@@ -1497,10 +1540,18 @@ def gen_chain(t, bpe, mw, ch, cids, clen, has_weights, parl, periodic=None, inte
         else:
             direction = 1
 
+        active_doc = interference.choose_doc(input_text, ch, periodic) if interference is not None and interference.docs else None
+        if active_doc is not None and t.D > 0 and active_doc.get("heavy"):
+            seed_tok = active_doc["heavy"][0]
+            if 0 <= seed_tok < t.V:
+                for d in range(t.D):
+                    gdest[d] = 0.97 * gdest[d] + 0.03 * t.tok[seed_tok * t.D + d]
+        doc_signal = interference_signal(active_doc, t.V) if active_doc is not None else None
+
         prompt = None
         used_interference = False
         if interference is not None and interference.docs and random.random() < clampf(0.3 + vel["interf_bonus"], 0.05, 0.5):
-            seed = interference.inject_seed(ch, bpe, periodic)
+            seed = interference.inject_seed(ch, bpe, periodic, active_doc)
             if seed is not None:
                 prompt = [seed]
                 used_interference = True
@@ -1561,7 +1612,7 @@ def gen_chain(t, bpe, mw, ch, cids, clen, has_weights, parl, periodic=None, inte
         for cand in range(3):
             if cand > 0 and gdest_save is not None:
                 gdest[:] = list(gdest_save)
-            result = gen_sent(t, bpe, mw, prompt, pl, temp, 256, parl, gdest, ch, vel)
+            result = gen_sent(t, bpe, mw, prompt, pl, temp, 256, parl, gdest, ch, vel, doc_signal)
             sc = coherence_score(mw, result, len(result), t.V)
             if sc > best_sc:
                 best_sc = sc
@@ -1582,7 +1633,7 @@ def gen_chain(t, bpe, mw, ch, cids, clen, has_weights, parl, periodic=None, inte
                 if longest["heavy"]:
                     prompt = [random.choice(longest["heavy"])]
                     direction = -direction if direction != 0 else 1
-                    best_out = gen_sent(t, bpe, mw, prompt, len(prompt), 0.55 if has_weights else 0.7, 256, parl, gdest, ch, vel)
+                    best_out = gen_sent(t, bpe, mw, prompt, len(prompt), 0.55 if has_weights else 0.7, 256, parl, gdest, ch, vel, doc_signal)
                     best_ol = len(best_out)
                     best_sc = coherence_score(mw, best_out, best_ol, t.V)
 
@@ -1641,7 +1692,7 @@ def gen_chain(t, bpe, mw, ch, cids, clen, has_weights, parl, periodic=None, inte
             nprom = min(3, chain_lens[seed_src])
             prompt = chain_ids[seed_src][chain_lens[seed_src] - nprom:chain_lens[seed_src]]
             reseed_temp = 0.55 if has_weights else 0.7
-            result = gen_sent(t, bpe, mw, prompt, nprom, reseed_temp, 256, parl, gdest, ch, vel)
+            result = gen_sent(t, bpe, mw, prompt, nprom, reseed_temp, 256, parl, gdest, ch, vel, doc_signal)
             new_sc = coherence_score(mw, result, len(result), t.V)
             old_sc = coherence_score(mw, chain_ids[weak_idx], chain_lens[weak_idx], t.V)
             if new_sc > old_sc * 0.7 or len(result) > chain_lens[weak_idx]:  # accept if reasonable

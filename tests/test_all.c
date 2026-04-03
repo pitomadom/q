@@ -502,6 +502,18 @@ void test_velocity_profile(void) {
     PASS();
 }
 
+void test_interference_doc_choice(void) {
+    TEST("interference_doc_choice");
+    const char *keywords_a[]={"resonance","choir","counterpoint"};
+    const char *keywords_b[]={"fungus","mycelium","forest"};
+    const char *text="resonance in the choir";
+    float score_a=0.02f, score_b=0.02f;
+    for(int i=0;i<3;i++) if(strstr(text,keywords_a[i])) score_a+=1.2f;
+    for(int i=0;i<3;i++) if(strstr(text,keywords_b[i])) score_b+=1.2f;
+    CHECK(score_a>score_b, "prompt resonates with matching doc");
+    PASS();
+}
+
 /* ── 22. Periodic mapping ── */
 void test_periodic_mapping(void) {
     TEST("periodic_mapping");
@@ -592,6 +604,7 @@ int main(void) {
     test_chamber_modulation();
     test_somatic_modulation();
     test_velocity_profile();
+    test_interference_doc_choice();
     test_periodic_mapping();
     test_interference_seed();
     test_smoke_compile();

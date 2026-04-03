@@ -714,13 +714,35 @@ class Interference {
           counts.set(a,(counts.get(a)||0)+1);
           counts.set(b,(counts.get(b)||0)+1);
         }
-        const heavy=[...counts.entries()].sort((a,b)=>b[1]-a[1]).map(([tok])=>tok).filter(tok=>{
-          const dec=currentBpe.decode([tok]).trim();
-          return dec.length>2&&/[a-z]/i.test(dec);
-        }).slice(0,32);
-        if(heavy.length)this.docs.push({name,heavy});
+        const words=[...counts.entries()].sort((a,b)=>b[1]-a[1]).map(([tok])=>{
+          const dec=currentBpe.decode([tok]).trim().toLowerCase();
+          return {tok,dec};
+        }).filter(x=>x.dec.length>2&&/[a-z]/i.test(x.dec)).slice(0,32);
+        const heavy=words.map(x=>x.tok);
+        const keywords=words.map(x=>x.dec).slice(0,16);
+        if(heavy.length)this.docs.push({name,heavy,keywords});
       }catch(_err){}
     }
+  }
+  chooseDoc(text,currentChambers,currentPeriodic){
+    if(!this.docs.length)return null;
+    const words=new Set(extractWords(text||''));
+    const dom=currentChambers?currentChambers.dominant():4;
+    let best=this.docs[0],bestScore=-Infinity;
+    for(const doc of this.docs){
+      let score=0.01*doc.heavy.length;
+      for(const word of (doc.keywords||[])){
+        if(words.has(word))score+=1.2;
+        if(word in ANCHORS&&ANCHORS[word]===dom)score+=0.6;
+        if(currentPeriodic){
+          const el=currentPeriodic.classify(word);
+          if(el&&el.ch===dom)score+=0.35*el.mass;
+        }
+      }
+      score+=Math.random()*0.05;
+      if(score>bestScore){bestScore=score;best=doc;}
+    }
+    return best;
   }
   injectSeed(currentChambers,currentBpe,currentPeriodic){
     if(!this.docs.length)return null;
@@ -739,6 +761,34 @@ class Interference {
     }
     return best;
   }
+  injectSeedFromDoc(doc,currentChambers,currentBpe,currentPeriodic){
+    if(!doc||!doc.heavy.length)return null;
+    const dom=currentChambers.dominant();
+    let best=doc.heavy[0],bestScore=-Infinity;
+    for(const tid of doc.heavy){
+      const word=currentBpe.decode([tid]).trim().toLowerCase();
+      let score=Math.random()*0.05;
+      if(word in ANCHORS&&ANCHORS[word]===dom)score+=1;
+      if(currentPeriodic){
+        const el=currentPeriodic.classify(word);
+        if(el&&el.ch===dom)score+=0.5*el.mass;
+      }
+      if(score>bestScore){bestScore=score;best=tid;}
+    }
+    return best;
+  }
+}
+
+function interferenceSignal(doc,V){
+  const out=new Float32Array(V);
+  if(!doc)return out;
+  let mx=0;
+  for(let rank=0;rank<doc.heavy.length&&rank<16;rank++){
+    const tid=doc.heavy[rank];
+    if(tid>=0&&tid<V){out[tid]+=1/(1+rank);if(out[tid]>mx)mx=out[tid];}
+  }
+  if(mx>1e-8)for(let i=0;i<V;i++)out[i]/=mx;
+  return out;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1016,6 +1066,7 @@ function genSentence(prompt,temp,gdest,velocity){
         if(en>1e-8){let dot=0;for(let d=0;d<D;d++)dot+=destiny[d]*tokEmb[i*D+d];ds=dot/(dn*en);}
       }
       raw[i]+=cHeb*heb[i]+cPro*pro[i]+cDs*ds+cBg*bg+cTg*tg;
+      if(velocity&&velocity.docSignal)raw[i]+=(hasTf?0.18:0.32)*velocity.docSignal[i];
       if(mw.unigram[i]<1e-6)raw[i]-=2;
       else if(mw.unigram[i]>0.01)raw[i]-=0.3*(mw.unigram[i]-0.01)*100;
     }
@@ -1154,9 +1205,15 @@ function generateChain(inputText){
 
   for(let si=0;si<CHAIN;si++){
     let dir=si<nb?-1:si===nb?0:1;
+    const activeDoc=interference&&interference.docs.length?interference.chooseDoc(inputText,chambers,periodic):null;
+    velocity.docSignal=activeDoc?interferenceSignal(activeDoc,V):null;
+    if(activeDoc&&activeDoc.heavy.length){
+      const seedTok=activeDoc.heavy[0];
+      if(seedTok>=0&&seedTok<V)for(let d=0;d<D;d++)gdest[d]=0.97*gdest[d]+0.03*tokEmb[seedTok*D+d];
+    }
     let prompt=null,usedInterf=false;
     if(interference&&interference.docs.length&&Math.random()<Math.max(0.05,Math.min(0.5,0.3+velocity.interfBonus))){
-      const seed=interference.injectSeed(chambers,bpe,periodic);
+      const seed=activeDoc?interference.injectSeedFromDoc(activeDoc,chambers,bpe,periodic):interference.injectSeed(chambers,bpe,periodic);
       if(seed!==null){prompt=[seed];usedInterf=true;}
     }
     if(!prompt&&inputText){
