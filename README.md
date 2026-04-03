@@ -369,6 +369,7 @@ Q inherits from and unifies several projects into a single resonant architecture
 - **[DOE](https://github.com/iamolegataeff/doe)** — Democracy of Experts, universal inference (original works with GGUF)
 - **[1984](https://github.com/iamolegataeff/1984)** — architecture implemented in 8 languages including ariannamethod.ai
 - **[Molecule](https://github.com/iamolegataeff/molecule)** — molecular neural architecture
+- **Jeff Schectman / Recursive Resonance line** — Q is partly inspired by this theoretical line where it sharpened coherence monitoring, hysteresis, threshold discipline, and regime-oriented resonance, without replacing the transformer path
 
 All active development is in Q. The frozen repos preserve the evolutionary history.
 
