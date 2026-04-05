@@ -22,6 +22,7 @@
 #include <sys/stat.h>
 #include <ctype.h>
 #include <unistd.h>
+#include <dirent.h>
 
 #define MAX_VOCAB    1280
 #define MAX_CTX      128
@@ -693,19 +694,20 @@ static float interf_item_score(const int *heavy, int n_heavy, const char keyword
 }
 
 static void interf_load(Interference *itf, const char *docs_dir, const BPE *bpe){
-    static const char *doc_names[]={
-        "bach_counterpoint.txt","bioluminescence.txt","byzantine_iconography.txt",
-        "dario_essay.txt","dickens_russian_lit.txt","mycorrhizal_networks.txt","polynesian_navigation.txt"
-    };
     memset(itf,0,sizeof(*itf));
-    for(size_t di=0;di<sizeof(doc_names)/sizeof(doc_names[0])&&itf->n_docs<MAX_INTERF_DOCS;di++){
-        char path[256]; snprintf(path,sizeof(path),"%s/%s",docs_dir,doc_names[di]);
+    DIR *d=opendir(docs_dir);
+    if(!d){printf("[interf] no %s/ directory\n",docs_dir);return;}
+    struct dirent *ent;
+    while((ent=readdir(d))!=NULL&&itf->n_docs<MAX_INTERF_DOCS){
+        char *dot=strrchr(ent->d_name,'.');
+        if(!dot||strcmp(dot,".txt")!=0) continue;
+        char path[256]; snprintf(path,sizeof(path),"%s/%s",docs_dir,ent->d_name);
         FILE *f=fopen(path,"rb"); if(!f) continue;
         fseek(f,0,SEEK_END); long sz=ftell(f); fseek(f,0,SEEK_SET);
         uint8_t *raw=malloc(sz>0?sz:1); fread(raw,1,sz,f); fclose(f);
         int *ids=malloc((sz>0?sz:1)*sizeof(int)); int n=bpe_encode(bpe,raw,(int)sz,ids,(int)sz);
         InterferenceDoc *doc=&itf->docs[itf->n_docs];
-        strncpy(doc->name,doc_names[di],sizeof(doc->name)-1);
+        strncpy(doc->name,ent->d_name,sizeof(doc->name)-1);
         interf_summarize_ids(ids,n,bpe,doc->heavy,&doc->n_heavy,doc->keywords,&doc->n_keywords,MAX_HEAVY,16);
         for(int start=0;start<n&&doc->n_chunks<MAX_DOC_CHUNKS;start+=32){
             int part_n=(n-start)>64?64:(n-start);
@@ -728,6 +730,7 @@ static void interf_load(Interference *itf, const char *docs_dir, const BPE *bpe)
         if(doc->n_heavy>0) itf->n_docs++;
         free(ids); free(raw);
     }
+    closedir(d);
 }
 static const InterferenceDoc *interf_choose_doc(const Interference *itf, const char *text, const Chambers *c, const PeriodicTable *pt, const MetaW *mw, const BPE *bpe){
     if(!itf||itf->n_docs<=0) return NULL;

@@ -179,6 +179,7 @@ body {
     <label>CORPUS <input type="file" id="f-corpus" accept=".txt"></label>
     <label>MERGES <input type="file" id="f-merges" accept=".merges"></label>
     <label>WEIGHTS <input type="file" id="f-weights" accept=".bin,.pt"></label>
+    <label>DOCS <input type="file" id="f-docs" accept=".txt" multiple></label>
     <span class="sep">|</span>
     <button class="btn" id="btn-demo">DEMO</button>
     <button class="btn" id="btn-gen" disabled>GENERATE</button>
@@ -203,7 +204,7 @@ const VEL_NAMES=['WALK','RUN','STOP','BREATHE','UP','DOWN'];
 const CH_NAMES=['FEAR','LOVE','RAGE','VOID','FLOW','CMPLX'];
 const CH_DECAY=[0.90,0.93,0.85,0.97,0.88,0.94];
 const COUPLING=[[0,-0.3,0.5,0.4,-0.2,0.1],[-0.3,0,-0.4,-0.5,0.5,0.2],[0.5,-0.3,0,0.2,-0.3,0.3],[0.4,-0.5,0.3,0,-0.3,0.4],[-0.2,0.4,-0.2,-0.3,0,0.3],[0.1,0.2,0.3,0.4,0.3,0]];
-const DOC_FILES=['bach_counterpoint.txt','bioluminescence.txt','byzantine_iconography.txt','dario_essay.txt','dickens_russian_lit.txt','mycorrhizal_networks.txt','polynesian_navigation.txt'];
+let DOC_FILES=[];  /* populated dynamically from file input or docs/ fetch */
 const ANCHORS={
   fear:0,terror:0,panic:0,threat:0,danger:0,horror:0,dread:0,alarm:0,
   love:1,warmth:1,gentle:1,care:1,heart:1,mother:1,child:1,touch:1,embrace:1,tenderness:1,affection:1,
@@ -852,13 +853,18 @@ class Interference {
       keywords:words.map(x=>x.dec).slice(0,keywordLimit)
     };
   }
-  async loadDocs(currentBpe){
+  async loadDocs(currentBpe,fileList){
     this.docs=[];
-    for(const name of DOC_FILES){
+    /* If files provided via input, use those; otherwise try fetching DOC_FILES from docs/ */
+    const sources=[];
+    if(fileList&&fileList.length){
+      for(const f of fileList) if(f.name.endsWith('.txt')) sources.push({name:f.name,getText:()=>f.text()});
+    }
+    for(const name of DOC_FILES) sources.push({name,getText:async()=>{const r=await fetch(`docs/${name}`);if(!r.ok)throw r;return r.text();}});
+    for(const src of sources){
       try{
-        const res=await fetch(`docs/${name}`);
-        if(!res.ok)continue;
-        const text=await res.text();
+        const text=await src.getText();
+        const name=src.name;
         const ids=currentBpe.encode(text);
         const doc={name,...this.summarizeIds(ids,currentBpe,32,16),chunks:[]};
         const chunkLen=64,stride=32;
@@ -1750,7 +1756,8 @@ async function initCorpus(text){
   const D=tf&&tf.loaded?tf.D:48;
   parliament=new Parliament(D,4);
   interference=new Interference();
-  await interference.loadDocs(bpe);
+  const docInput=$('#f-docs');
+  await interference.loadDocs(bpe,docInput&&docInput.files.length?docInput.files:null);
   log(`[3] Parliament: ${parliament.n} experts, rank=${DOE_RANK}, d=${D}`);
   log(tf&&tf.loaded?`[4] Transformer: V=${tf.V} D=${tf.D} L=${tf.NL} nc=${tf.NC} nr=${tf.NR} nj=${tf.NJ}`:'[4] No weights — MetaWeights only mode');
   if(interference.docs.length)log(`[4.5] Interference: ${interference.docs.length} docs loaded`);
