@@ -1,9 +1,5 @@
 # PostGPT-Q — Resonant Reasoning Engine 
 
-> Intelligence is how far ahead you can see and how deeply you can look - without breaking under what that reveals.
->
-> Jeff Schectman
-
 **θ = ε + γ + αδ**
 
 A 1182-line C inference engine that combines a trained transformer with statistical MetaWeights, a living parliament of LoRA experts, and somatic chambers — producing coherent text from a 2M parameter model that has no right to be coherent.
@@ -369,7 +365,7 @@ Q inherits from and unifies several projects into a single resonant architecture
 - **[DOE](https://github.com/iamolegataeff/doe)** — Democracy of Experts, universal inference (original works with GGUF)
 - **[1984](https://github.com/iamolegataeff/1984)** — architecture implemented in 8 languages including ariannamethod.ai
 - **[Molecule](https://github.com/iamolegataeff/molecule)** — molecular neural architecture
-- **Jeff Schectman / Recursive Resonance line** — Q is partly inspired by this theoretical line where it sharpened coherence monitoring, hysteresis, threshold discipline, and regime-oriented resonance, without replacing the transformer path
+- **Minhyeok Lee** — [Emergence of Self-Identity in AI](https://arxiv.org/abs/2411.18530) — mathematical framework for self-identity that Q implements through somatic chambers and contrastive projection
 
 All active development is in Q. The frozen repos preserve the evolutionary history.
 
