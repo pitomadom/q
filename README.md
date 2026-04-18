@@ -369,6 +369,11 @@ Q inherits from and unifies several projects into a single resonant architecture
 
 All active development is in Q. The frozen repos preserve the evolutionary history.
 
+## License
+
+This project is licensed under the **GNU General Public License v3.0**.  
+See [LICENSE](LICENSE) for the full text.
+
 ---
 
 *PostGPT-Q. 1182 lines of C. 1644 lines of Python. 1256 lines of HTML. Three engines, one resonance. Unbreakable.*
